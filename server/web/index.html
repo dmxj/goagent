@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GoAgent</title>
+<style>
+  :root { --bg:#f7f8fa; --panel:#fff; --ink:#1d2433; --muted:#667085; --line:#e4e7ec; --accent:#007d9c; --accent-soft:#e6f6fa; --err:#c4320a; --mono: ui-monospace, "JetBrains Mono", Menlo, monospace; }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 15px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; color:var(--ink); background:var(--bg); height:100vh; display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 20px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header b { font-size:16px; } header span { color:var(--muted); font-size:13px; }
+  header button { margin-left:auto; }
+  main { flex:1; overflow:auto; padding:24px 0; }
+  .wrap { max-width:860px; margin:0 auto; padding:0 20px; }
+  .msg { margin:0 0 20px; }
+  .user { background:var(--accent-soft); border-radius:12px; padding:10px 14px; margin-left:15%; white-space:pre-wrap; }
+  .assistant .text { white-space:pre-wrap; }
+  .step { font:13px/1.5 var(--mono); border:1px solid var(--line); border-radius:8px; background:var(--panel); margin:8px 0; }
+  .step summary { cursor:pointer; padding:6px 10px; color:var(--muted); list-style:none; }
+  .step summary b { color:var(--ink); font-weight:600; }
+  .step pre { margin:0; padding:8px 10px; border-top:1px solid var(--line); max-height:280px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
+  .step.err summary b { color:var(--err); }
+  .think { color:var(--muted); font-size:13px; border-left:3px solid var(--line); padding-left:10px; white-space:pre-wrap; max-height:160px; overflow:auto; }
+  .perm { border:1px solid #f5b971; background:#fff8ef; border-radius:8px; padding:10px; margin:8px 0; font-size:14px; }
+  .perm pre { font:12px var(--mono); white-space:pre-wrap; }
+  footer { background:var(--panel); border-top:1px solid var(--line); padding:14px 0; }
+  form { display:flex; gap:10px; }
+  textarea { flex:1; resize:none; height:64px; padding:10px 12px; border:1px solid var(--line); border-radius:10px; font:inherit; outline:none; }
+  textarea:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  button { border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:6px 14px; font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .meta { color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<header><b>GoAgent</b><span id="info">连接中…</span><button id="newBtn">新会话</button></header>
+<main><div class="wrap" id="log"></div></main>
+<footer><div class="wrap"><form id="f"><textarea id="q" placeholder="输入任务，Enter 发送，Shift+Enter 换行"></textarea><button class="primary" id="send">发送</button></form></div></footer>
+<script>
+const $ = s => document.querySelector(s);
+let sessionId = localStorage.getItem('goagent.session') || '';
+let running = false;
+// 服务端设置了 -token 时，通过 ?token=xxx 打开页面一次即可（令牌保存在 localStorage）
+const qsToken = new URLSearchParams(location.search).get('token');
+if (qsToken) { localStorage.setItem('goagent.token', qsToken); history.replaceState(null, '', location.pathname); }
+const token = localStorage.getItem('goagent.token') || '';
+// 使用相对路径，使界面在被挂载到子路径（如 /agent/）时也能工作
+const api = (path, opts = {}) => fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}), ...(opts.headers || {}) } });
+api('v1/info').then(r => r.json()).then(i => { $('#info').textContent = `${i.model} · ${i.tools.length} 个工具 · ${i.work_dir}`; });
+$('#newBtn').onclick = () => { sessionId = ''; localStorage.removeItem('goagent.session'); $('#log').innerHTML = ''; };
+$('#q').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#f').requestSubmit(); } });
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+function setSummary(s, icon, name, meta) { s.replaceChildren(icon + ' ', el('b', '', name), ' ', el('span', 'meta', meta)); }
+function scroll() { const m = document.querySelector('main'); m.scrollTop = m.scrollHeight; }
+$('#f').onsubmit = async e => {
+  e.preventDefault();
+  if (running) { await api(`v1/sessions/${sessionId}/cancel`, { method: 'POST' }); return; }
+  const text = $('#q').value.trim(); if (!text) return;
+  $('#q').value = '';
+  $('#log').append(el('div', 'msg user', text));
+  const box = el('div', 'msg assistant'); $('#log').append(box);
+  let textEl = null, thinkEl = null; const steps = {};
+  running = true; $('#send').textContent = '停止';
+  const resp = await api('v1/chat', { method: 'POST', body: JSON.stringify({ session_id: sessionId, message: text }) });
+  const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = '';
+  const handle = (type, ev) => {
+    switch (type) {
+      case 'session': sessionId = ev.session_id; localStorage.setItem('goagent.session', sessionId); break;
+      case 'thinking_delta': if (!thinkEl) { thinkEl = el('div', 'think'); box.append(thinkEl); } thinkEl.textContent += ev.text; break;
+      case 'text_delta': thinkEl = null; if (!textEl) { textEl = el('div', 'text'); box.append(textEl); } textEl.textContent += ev.text; break;
+      case 'tool_call': {
+        textEl = null; thinkEl = null;
+        const d = el('details', 'step'); const s = el('summary'); setSummary(s, '⏳', ev.tool.name, ev.agent);
+        d.append(s, el('pre', '', JSON.stringify(ev.tool.input, null, 2))); box.append(d); steps[ev.tool.id] = d; break; }
+      case 'tool_result': {
+        const d = steps[ev.tool.id]; if (!d) break;
+        setSummary(d.querySelector('summary'), ev.tool.is_error ? '✗' : '✓', ev.tool.name, `${ev.tool.duration_ms}ms · ${ev.agent}`);
+        if (ev.tool.is_error) d.classList.add('err');
+        d.append(el('pre', '', ev.tool.output)); break; }
+      case 'permission_request': {
+        const p = el('div', 'perm'); p.append(el('div', '', `需要确认：${ev.permission.tool}（${ev.permission.reason}）`), el('pre', '', JSON.stringify(ev.permission.input, null, 2)));
+        const ok = el('button', 'primary', '允许'), no = el('button', '', '拒绝');
+        const decide = allow => { api(`v1/permissions/${ev.permission.id}`, { method: 'POST', body: JSON.stringify({ allow }) }); p.remove(); };
+        ok.onclick = () => decide(true); no.onclick = () => decide(false); p.append(ok, document.createTextNode(' '), no); box.append(p); break; }
+      case 'error': box.append(el('div', 'step err', '错误：' + ev.error)); break;
+      case 'run_end': box.append(el('div', 'meta', `${ev.data.turns} 轮 · 输入 ${ev.usage.input_tokens} / 输出 ${ev.usage.output_tokens} tokens`)); break;
+    }
+    scroll();
+  };
+  while (true) {
+    const { value, done } = await reader.read(); if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n\n')) >= 0) {
+      const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+      let type = 'message', data = '';
+      for (const line of chunk.split('\n')) { if (line.startsWith('event: ')) type = line.slice(7); else if (line.startsWith('data: ')) data += line.slice(6); }
+      if (data) handle(type, JSON.parse(data));
+    }
+  }
+  running = false; $('#send').textContent = '发送';
+};
+</script>
+</body>
+</html>

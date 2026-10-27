@@ -1,0 +1,73 @@
+{
+  "provider": {
+    "type": "anthropic",
+    "base_url": "https://api.anthropic.com",
+    "api_key": "${ANTHROPIC_API_KEY}",
+    "headers": {},
+    "retries": 4
+  },
+  "model": "claude-sonnet-4-5",
+  "max_tokens": 8192,
+  "temperature": 0.2,
+  "thinking_budget": 0,
+  "context_window": 200000,
+  "max_turns": 60,
+
+  "profiles": {
+    "deepseek": {
+      "provider": { "type": "openai", "base_url": "https://api.deepseek.com/v1", "api_key": "${DEEPSEEK_API_KEY}" },
+      "model": "deepseek-chat",
+      "context_window": 64000
+    },
+    "qwen": {
+      "provider": { "type": "openai", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": "${DASHSCOPE_API_KEY}" },
+      "model": "qwen-plus",
+      "context_window": 128000
+    },
+    "kimi": {
+      "provider": { "type": "openai", "base_url": "https://api.moonshot.cn/v1", "api_key": "${MOONSHOT_API_KEY}" },
+      "model": "kimi-k2-0905-preview",
+      "context_window": 256000
+    },
+    "ollama": {
+      "provider": { "type": "openai", "base_url": "http://localhost:11434/v1" },
+      "model": "qwen2.5-coder:7b",
+      "context_window": 32000,
+      "max_tokens": 4096
+    }
+  },
+
+  "permissions": {
+    "mode": "default",
+    "allow": ["bash(go test:*)", "bash(go build:*)", "bash(go vet:*)", "bash(git status)", "bash(git diff:*)", "web_fetch(domain:pkg.go.dev)"],
+    "ask": ["write_file(go.mod)"],
+    "deny": ["bash(rm -rf:*)", "bash(git push:*)", "write_file(.env)"]
+  },
+
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "bash", "command": "jq -r '.tool_input.command' | grep -qE 'sudo ' && { echo '禁止使用 sudo' >&2; exit 2; } || exit 0", "timeout": 10 }
+    ],
+    "PostToolUse": [
+      { "matcher": "write_file|edit_file", "command": "gofmt -l . 2>/dev/null | head -5", "timeout": 30 }
+    ],
+    "Stop": []
+  },
+
+  "mcp_servers": {
+    "demo": { "command": "go", "args": ["run", "./examples/mcp-server"] }
+  },
+
+  "tools": {
+    "disabled": [],
+    "restrict_to_workdir": true,
+    "require_read_before_edit": true,
+    "bash_timeout_sec": 120
+  },
+
+  "memory": { "enabled": true },
+  "compact": { "enabled": true, "threshold": 0.8, "keep_recent": 2 },
+  "trace": { "enabled": true },
+
+  "system_prompt_append": ""
+}
