@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dmxj/goagent/llm"
 )
@@ -189,3 +190,78 @@ func matchAny(patterns []string, name string) bool {
 	}
 	return false
 }
+
+// InputReadOnly 由"是否只读取决于参数"的工具实现。
+//
+// 例如 task 工具：委派给只读的 explore 子 Agent 时整个调用都不会修改环境，
+// plan 模式应当允许；委派给 general-purpose 时则不是只读的。
+type InputReadOnly interface {
+	ReadOnlyFor(input json.RawMessage) bool
+}
+
+// IsReadOnly 判断某次调用是否只读：优先询问工具的 ReadOnlyFor，否则使用 Info().ReadOnly。
+func IsReadOnly(t Tool, input json.RawMessage) bool {
+	if ro, ok := t.(InputReadOnly); ok {
+		return ro.ReadOnlyFor(input)
+	}
+	return t.Info().ReadOnly
+}
+
+// Options 是通过配置覆盖的单个工具选项（对应配置 tools.options.<工具名>）。
+type Options struct {
+	// Description 非空时替换发给模型的工具描述。
+	Description string `json:"description,omitempty"`
+	// TimeoutSec > 0 时为该工具单独设置超时（秒）。
+	TimeoutSec int `json:"timeout_sec,omitempty"`
+	// MaxOutput > 0 时把该工具的输出截断到这么多字节。
+	MaxOutput int `json:"max_output,omitempty"`
+	// Concurrent 非 nil 时覆盖是否允许并行执行。
+	Concurrent *bool `json:"concurrent,omitempty"`
+}
+
+// IsZero 报告是否没有任何覆盖。
+func (o Options) IsZero() bool {
+	return o.Description == "" && o.TimeoutSec <= 0 && o.MaxOutput <= 0 && o.Concurrent == nil
+}
+
+// Configure 用配置选项包装一个工具；没有任何覆盖时原样返回。
+func Configure(t Tool, o Options) Tool {
+	if o.IsZero() {
+		return t
+	}
+	return &configured{inner: t, opts: o}
+}
+
+type configured struct {
+	inner Tool
+	opts  Options
+}
+
+func (c *configured) Info() Info {
+	info := c.inner.Info()
+	if c.opts.Description != "" {
+		info.Description = c.opts.Description
+	}
+	if c.opts.Concurrent != nil {
+		info.Concurrent = *c.opts.Concurrent
+	}
+	return info
+}
+
+func (c *configured) ReadOnlyFor(input json.RawMessage) bool { return IsReadOnly(c.inner, input) }
+
+func (c *configured) Run(ctx context.Context, call *Call) (*Result, error) {
+	if c.opts.TimeoutSec > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(c.opts.TimeoutSec)*time.Second)
+		defer cancel()
+	}
+	r, err := c.inner.Run(ctx, call)
+	if r != nil && c.opts.MaxOutput > 0 {
+		r.Content = Truncate(r.Content, c.opts.MaxOutput)
+	}
+	return r, err
+}
+
+// Unwrap 返回被包装的工具。
+func (c *configured) Unwrap() Tool { return c.inner }

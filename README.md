@@ -8,7 +8,7 @@ goagent 是中文 Go 学习平台「Agent 框架专栏」的配套项目：教�
 
 ```text
 $ goagent
-GoAgent v0.1.0  模型 deepseek-chat · 14 个工具 · 2 个技能 · 权限 default
+GoAgent v0.1.1  模型 deepseek-chat · 14 个工具 · 2 个技能 · 权限 default
 › 给 config 包补充表驱动测试，并确保 go test 通过
 ⏺ todo_write (…)
 ⏺ read_file (config/config.go)
@@ -84,8 +84,9 @@ goagent/
 ├── mcp/                # MCP 客户端（stdio / HTTP）与极简服务器
 ├── trace/              # Span、导出器、树形渲染
 ├── prompt/             # 系统提示词组装
-├── config/             # 分层配置加载
-├── app/                # 依赖组装（CLI 与 HTTP 服务共用）
+├── config/             # 分层配置加载（模型、参数、提示词、工具、技能、子 Agent……）
+├── procenv/            # bash 与命令钩子的环境变量过滤（白名单 + 密钥黑名单）
+├── app/                # 依赖组装与配置热更新（CLI 与 HTTP 服务共用）
 ├── server/             # HTTP API、SSE、Web 审批、内置界面（web/index.html）
 ├── cmd/goagent/        # 命令行入口
 ├── internal/           # frontmatter 解析、跨平台子进程管理
@@ -170,40 +171,41 @@ goagent serve                            # 启动 HTTP 服务，浏览器打开 
 
 ### config.json 全字段示例
 
+模型、参数、系统提示词、工具绑定、技能、子 Agent、MCP、权限、钩子**全部由配置决定**，代码里没有写死。
 完整可用的示例见 [`.goagent/config.example.json`](.goagent/config.example.json)，复制为 `.goagent/config.json` 后按需修改。
-字符串中的 `${VAR}` 会展开为环境变量（适用于 `provider` 与 `profiles` 的 `base_url` / `api_key` / `headers`，
-以及 MCP 服务器的 `command` / `args` / `url` / `env` / `headers`），**推荐把密钥留在环境变量里**。
+字符串中的 `${VAR}` 会展开为环境变量（适用于 `provider` / `profiles` 的 `base_url` / `api_key` / `headers`、
+`params.extra_headers`、`tools.bash_env.extra`，以及 MCP 服务器的 `command` / `args` / `url` / `env` / `headers`），**推荐把密钥留在环境变量里**。
 
 ```json
 {
-  "provider": { "type": "anthropic", "base_url": "https://api.anthropic.com", "api_key": "${ANTHROPIC_API_KEY}", "headers": {}, "retries": 4 },
+  "provider": { "type": "anthropic", "base_url": "${GOAGENT_LAB_BASE_URL}", "api_key": "${GOAGENT_LAB_API_KEY}", "retries": 4 },
   "model": "claude-sonnet-4-5",
-  "max_tokens": 8192,
-  "temperature": 0.2,
-  "thinking_budget": 0,
-  "context_window": 200000,
-  "max_turns": 60,
+  "params": {
+    "max_tokens": 8192, "temperature": 0.2, "top_p": 0.95, "top_k": 0, "thinking_budget": 0,
+    "stop": [], "stream": true, "extra_headers": { "x-team": "go" }, "extra_body": {}
+  },
+  "system_prompt_file": ".goagent/prompts/system.md",
+  "prompt": {
+    "append": "回答时附上相关文件路径。",
+    "sections": { "environment": true, "memory": false },
+    "extra": [{ "title": "团队约定", "file": "docs/conventions.md" }]
+  },
+  "tools": {
+    "enabled": ["read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "bash", "todo_write", "skill", "task", "mcp__github__*"],
+    "disabled": ["web_fetch"],
+    "options": { "bash": { "timeout_sec": 300, "description": "只用来跑 go 命令" } },
+    "bash_env": { "allow": ["MY_VAR"], "deny": [], "extra": { "GH_TOKEN": "${GH_TOKEN}" }, "inherit_all": false }
+  },
+  "skills": { "dirs": ["~/.goagent/skills", ".goagent/skills"], "enabled": [], "disabled": ["legacy-*"] },
+  "agents": { "dirs": [".goagent/agents"], "disabled": [] },
   "profiles": {
-    "deepseek": { "provider": { "type": "openai", "base_url": "https://api.deepseek.com/v1", "api_key": "${DEEPSEEK_API_KEY}" }, "model": "deepseek-chat", "context_window": 64000 }
+    "deepseek": { "provider": { "type": "openai", "base_url": "https://api.deepseek.com/v1", "api_key": "${DEEPSEEK_API_KEY}" }, "model": "deepseek-chat" }
   },
-  "permissions": {
-    "mode": "default",
-    "allow": ["bash(go test:*)", "web_fetch(domain:pkg.go.dev)"],
-    "ask": ["write_file(go.mod)"],
-    "deny": ["bash(rm -rf:*)", "bash(git push:*)"]
-  },
-  "hooks": {
-    "PostToolUse": [{ "matcher": "write_file|edit_file", "command": "gofmt -l .", "timeout": 30 }]
-  },
-  "mcp_servers": {
-    "github": { "type": "http", "url": "https://api.githubcopilot.com/mcp/", "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" } },
-    "demo": { "command": "go", "args": ["run", "./examples/mcp-server"] }
-  },
-  "tools": { "disabled": ["web_fetch"], "restrict_to_workdir": true, "require_read_before_edit": true, "bash_timeout_sec": 120 },
-  "memory": { "enabled": true },
-  "compact": { "enabled": true, "threshold": 0.8, "keep_recent": 2 },
-  "trace": { "enabled": true },
-  "system_prompt_append": "回答时附上相关文件路径。"
+  "permissions": { "mode": "default", "allow": ["bash(go test:*)"], "ask": ["write_file(go.mod)"], "deny": ["bash(rm -rf:*)"] },
+  "hooks": { "PostToolUse": [{ "matcher": "write_file|edit_file", "command": "gofmt -l .", "timeout": 30 }] },
+  "mcp_servers": { "demo": { "command": "go", "args": ["run", "./examples/mcp-server"] } },
+  "trace": { "enabled": true, "max_field_bytes": 4194304 },
+  "reload": { "enabled": true, "interval_ms": 1000 }
 }
 ```
 
@@ -221,6 +223,17 @@ goagent serve                            # 启动 HTTP 服务，浏览器打开 
 | `permissions` | `default` 模式 | 见[权限](#权限) |
 | `hooks` | — | 见 [Hooks](#hooks) |
 | `mcp_servers` | — | 见 [MCP](#mcp) |
+| `params.*` | — | 模型参数：`max_tokens`、`temperature`、`top_p`、`top_k`、`thinking_budget`、`stop`、`stream`（false 走非流式接口）、`extra_headers`、`extra_body`（合并进厂商原生请求体）。旧版顶层 `max_tokens` / `temperature` / `thinking_budget` 仍然有效，`params` 优先 |
+| `system_prompt` / `system_prompt_file` | 内置身份 | 替换系统提示词的身份与行为准则部分；文件路径相对工作目录，文件优先 |
+| `prompt.append` / `append_file` / `sections` / `extra` | — | 追加内容、开关内置章节（environment / tools / skills / subagents / mcp / instructions / memory）、追加自定义章节 |
+| `tools.enabled` / `tools.disabled` | 全部启用 | 工具白名单 / 黑名单，支持 `*` 通配（如 `mcp__github__*`）；对内置、记忆、skill、task、MCP、自定义工具一视同仁 |
+| `tools.options.<工具>` | — | 单个工具的覆盖：`description`、`timeout_sec`、`max_output`、`concurrent` |
+| `tools.bash_env` | 白名单 | bash 与命令钩子的环境变量策略，见[子进程环境变量](#子进程环境变量) |
+| `tools.timeout_sec` / `max_parallel` / `max_result_bytes` | `600` / `8` / `40000` | 单个工具调用的总超时、并行上限、回填给模型的最大字节数 |
+| `skills.dirs` / `enabled` / `disabled` | 用户级 + 项目级 | 技能扫描目录与启用名单 |
+| `agents.dirs` / `enabled` / `disabled` | 用户级 + 项目级 | 自定义子 Agent 目录与启用名单（内置 explore、general-purpose 也可以禁用） |
+| `trace.max_field_bytes` | `4194304` | Trace 中单个原始字段（请求体、原始流、工具输出）的上限，超出部分截断并标注 |
+| `reload.enabled` / `interval_ms` | `true` / `1000` | 配置热更新开关与轮询间隔 |
 | `tools.disabled` | — | 禁用的工具名 |
 | `tools.restrict_to_workdir` | `true` | 文件工具只能访问工作目录内的路径 |
 | `tools.require_read_before_edit` | `true` | 修改已有文件前必须先 `read_file` |
@@ -229,6 +242,29 @@ goagent serve                            # 启动 HTTP 服务，浏览器打开 
 | `compact.enabled` / `threshold` / `keep_recent` | `true` / `0.8` / `2` | 自动压缩：超过窗口 80% 时压缩，保留最近 2 轮用户输入 |
 | `trace.enabled` | `true` | 把 Trace 写入 `.goagent/traces/日期.jsonl` |
 | `system_prompt_append` | — | 追加到系统提示词末尾的内容 |
+
+### 热更新
+
+`goagent`（交互模式）与 `goagent serve` 会监视以下文件，**保存后下一条消息立即使用新配置，无需重启**：
+
+- `~/.claude/settings.json`、`~/.goagent/config.json`、`.goagent/config.json`
+- `system_prompt_file`、`prompt.append_file`、`prompt.extra[].file` 引用的提示词文件
+- `skills.dirs` 与 `agents.dirs` 下的全部文件（新建一个技能目录，下一条消息就能用）
+- 从工作目录到 git 根目录每一层的 `AGENTS.md` / `GOAGENT.md` / `CLAUDE.md`，以及 `~/.goagent/AGENTS.md`
+
+实现是零依赖的 mtime 轮询（默认每秒一次，每条消息开始前还会同步检查一次）。检测到变化后重新组装一份不可变的"运行时快照"
+（Provider、参数、提示词、工具注册表、技能、子 Agent、权限规则、钩子、MCP 连接）并原子替换：
+
+- 正在运行的对话继续使用开始时的旧快照，这一轮结束后下一轮使用新快照；
+- 新配置有错误（JSON 格式、非法权限规则、钩子正则、引用的文件不存在、参数越界）时**保留上一份可用配置**，
+  错误通过日志、`GET /v1/config` 的 `last_error` 与 `/v1/events` 的 `config_error` 事件报告；
+- 会话运行标志、文件访问记录、"本会话总是允许"、长期记忆、Trace、会话存储跨版本共享；配置没变的 MCP 服务器复用连接，
+  被替换的旧连接在最后一个使用它的对话结束后关闭。
+
+交互模式下可以用 `/reload` 立即重新加载、`/config` 查看版本与最近一次错误；HTTP 服务对应 `POST /v1/reload` 与 `GET /v1/config`。
+
+`reload.enabled` 设为 `false` 后，提示词、技能、`AGENTS.md` 等文件的修改不再触发重新加载，但配置文件本身仍被留意：
+运行中把它改回 `true` 即可恢复热更新。`goagent run` 是一次性任务，不启动监视。
 
 ### 环境变量
 
@@ -248,6 +284,16 @@ goagent serve                            # 启动 HTTP 服务，浏览器打开 
 | `NO_COLOR` | 关闭终端颜色 |
 
 bash 工具执行的命令中会带上 `GOAGENT=1`，脚本可以据此判断自己是否运行在 Agent 中。
+
+### 子进程环境变量
+
+bash 工具与命令钩子**不会继承完整的进程环境**（否则模型执行一条 `env` 就能读到 API Key）。默认只传递白名单变量：
+`PATH`、`HOME`、`USER`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TMPDIR`、`TZ`、`GO*`、`CGO_*`、代理变量（带用户名密码的除外）
+以及 Windows 运行命令所需的系统变量；名称匹配 `*KEY*`、`*TOKEN*`、`*SECRET*`、`*PASSWORD*`、`*AUTH*`、`*CREDENTIAL*`、
+`GOAGENT_*`、`ANTHROPIC_*`、`OPENAI_*`、`DEEPSEEK_*`、`AWS_*`、`GITHUB_*` 等的变量一律剔除。
+
+`tools.bash_env` 可以调整：`allow` 追加允许的变量（精确写出的名字可以放行黑名单中的变量）、`deny` 追加拒绝（优先级最高）、
+`extra` 注入变量（值支持 `${VAR}`）、`inherit_all: true` 从完整环境出发但仍剔除密钥。实现见 `procenv` 包。
 
 ### 从 Claude Code 导入
 
@@ -325,7 +371,8 @@ goagent version | help
 goagent run -mode accept_edits -p "修复 go vet 报告的问题" -json | jq -r 'select(.type=="tool_call") | .tool.name'
 ```
 
-交互模式下按 `Ctrl+C` 中断当前任务（不会退出程序），输入 `/exit` 或 `Ctrl+D` 退出。
+交互模式下按 `Ctrl+C` 中断当前任务（不会退出程序）；空闲时按一次只给出提示，2 秒内连按两次退出，
+也可以输入 `/exit` 或 `Ctrl+D` 退出。空闲时按下的 `Ctrl+C` 不会影响下一个任务。
 
 ### 斜杠命令
 
@@ -336,8 +383,10 @@ goagent run -mode accept_edits -p "修复 go vet 报告的问题" -json | jq -r 
 | `/resume <id>` | 恢复会话 |
 | `/sessions` | 会话列表 |
 | `/compact` | 手动压缩上下文 |
-| `/model [名称]` | 查看 / 切换模型（名称可以是 profile 名） |
+| `/model [名称]` | 查看 / 切换模型（名称可以是 profile 名，Provider 一起切换，下一条消息生效） |
 | `/mode [模式]` | 查看 / 切换权限模式 |
+| `/config` | 配置版本、来源与最近一次加载错误 |
+| `/reload` | 立即重新加载配置 |
 | `/tools`、`/skills`、`/agents` | 列出工具、技能、子 Agent |
 | `/memory` | 查看长期记忆索引 |
 | `/trace` | 以树形查看本会话的 trace |
@@ -356,22 +405,28 @@ goagent run -mode accept_edits -p "修复 go vet 报告的问题" -json | jq -r 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查（无需令牌）：`{"status":"ok","version":"..."}` |
-| `GET` | `/v1/info` | 模型、工具、技能、子 Agent、MCP 服务器、权限模式、配置来源与警告 |
+| `GET` | `/v1/info` | 模型、工具、技能、子 Agent、MCP 服务器、权限模式、配置来源、配置版本与警告 |
+| `GET` | `/v1/config` | 生效配置（密钥已脱敏）、来源文件、监视的路径、配置版本、加载时间、最近一次错误、当前系统提示词 |
+| `POST` | `/v1/reload` | 立即重新加载配置（并重试连接失败的 MCP 服务器）；失败返回 `422` 与错误，当前配置不变 |
+| `GET` | `/v1/events` | 服务级 SSE：`hello`、`config_reloaded`、`config_error` |
 | `POST` | `/v1/chat` | 运行一轮对话，**SSE** 推送事件。请求体 `{"session_id":"可选","message":"..."}` |
-| `GET` | `/v1/sessions` | 会话列表 |
+| `GET` | `/v1/sessions` | 会话列表：`id`、`title`（第一条用户消息的前 40 字）、`created_at`、`updated_at`、`messages`、`model`、`usage`、`running` |
 | `POST` | `/v1/sessions` | 新建会话，返回 `{"id":"..."}` |
-| `GET` | `/v1/sessions/{id}` | 会话详情：消息、用量、摘要、是否运行中 |
-| `DELETE` | `/v1/sessions/{id}` | 删除会话 |
+| `GET` | `/v1/sessions/{id}` | 会话详情：**完整消息历史**（text / thinking / tool_use / tool_result 内容块）、用量、摘要、是否运行中、等待中的审批 |
+| `DELETE` | `/v1/sessions/{id}` | 删除会话（运行中返回 `409`） |
 | `POST` | `/v1/sessions/{id}/cancel` | 取消正在运行的任务 |
 | `POST` | `/v1/sessions/{id}/steer` | 运行中追加一条用户消息 `{"message":"..."}`，在下一次调用模型前送达 |
-| `POST` | `/v1/sessions/{id}/compact` | 手动压缩上下文 |
+| `POST` | `/v1/sessions/{id}/compact` | 手动压缩上下文（运行中返回 `409`） |
 | `GET` | `/v1/sessions/{id}/files` | 本会话访问过的文件 |
 | `GET` | `/v1/sessions/{id}/todos` | 本会话的待办清单 |
-| `POST` | `/v1/permissions/{id}` | 提交审批结果 `{"allow":true,"remember":false}` |
-| `GET` | `/v1/traces` | 查询 Span，可选 `?trace_id=` 或 `?session_id=` |
-| `GET` | `/v1/traces/{id}/tree` | 纯文本树形 trace |
+| `GET` | `/v1/permissions` | 等待中的审批，可选 `?session_id=`（页面刷新后恢复审批弹窗） |
+| `POST` | `/v1/permissions/{id}` | 提交审批结果 `{"allow":true,"remember":false}`：`200` 已送达，`404` 不存在，`409` 已处理或已过期（重复提交安全、不阻塞） |
+| `GET` | `/v1/traces` | 查询 Span（含进行中的），可选 `?trace_id=`、`?session_id=`、`?light=1`（大属性只保留预览） |
+| `GET` | `/v1/traces/{id}/tree` | JSON 树形 trace，每个节点带完整属性与 `children`；`?format=text` 返回终端风格文本树 |
+| `GET` | `/v1/traces/{id}/spans/{span_id}` | 单个 Span 的完整数据 |
 
-同一会话正在运行时再次调用 `/v1/chat` 返回 `409`；客户端断开连接会取消运行。
+同一会话正在运行时再次调用 `/v1/chat` 返回 `409`；客户端断开连接会取消运行；服务关闭（SIGTERM）时先取消所有运行，
+前端会收到 `error`、`run_end` 与 `done`。
 
 ```bash
 curl -N http://127.0.0.1:8787/v1/chat -H 'Content-Type: application/json' \
@@ -404,8 +459,8 @@ data: {"session_id":"20261027-153000-a1b2c3"}
 
 | 事件 | 触发时机 | 主要字段 |
 | --- | --- | --- |
-| `session` | 连接建立，第一个事件 | `session_id` |
-| `run_start` | 开始处理输入 | `text`（用户输入）、`data.trace_id`、`data.model` |
+| `session` | 连接建立，第一个事件 | `session_id`、`config_version` |
+| `run_start` | 开始处理输入 | `text`（用户输入）、`data.trace_id`、`data.model`、`data.config_version` |
 | `turn_start` | 每一轮调用模型前 | `turn` |
 | `thinking_delta` | 思考过程增量 | `text` |
 | `text_delta` | 回答文本增量 | `text` |
@@ -419,10 +474,10 @@ data: {"session_id":"20261027-153000-a1b2c3"}
 | `compact` | 上下文被压缩 | `text`（摘要）、`data.tokens_before`、`data.tokens_after` |
 | `retry` | 模型调用失败后重试 | `text` |
 | `log` | 运行日志（bash 命令、钩子输出、插话送达等） | `text` |
-| `span_start` / `span_end` | Trace Span 开始 / 结束 | `span` |
+| `span_start` / `span_end` | Trace Span 开始 / 结束（包括 `subagent.*`，前端无需刷新即可画出子 Agent 子树） | `span`（轻量快照，见 [Trace 查看](#trace-查看)） |
 | `error` | 运行出错（模型错误、取消、超过轮数） | `error` |
 | `run_end` | 运行结束，**无论成功失败都是最后一个 Agent 事件** | `text`（最终回答）、`usage`、`data.turns`、`data.stop_reason`、`data.trace_id` |
-| `done` | SSE 流结束 | `session_id` |
+| `done` | SSE 流结束 | `session_id`、`title` |
 
 `stop_reason` 取值：`end_turn`、`max_tokens`、`blocked`（被 UserPromptSubmit 钩子拦截）、`cancelled`、`max_turns`、`error`。
 
@@ -441,15 +496,28 @@ data: {"session_id":"20261027-153000-a1b2c3"}
 
 | 规则 | 匹配 |
 | --- | --- |
-| `bash(go test:*)` | 以 `go test` 开头的命令（`:*` 表示前缀匹配） |
+| `bash(go test:*)` | 命令 `go test` 或以 `go test ` 开头的命令（`:*` 表示任意参数） |
 | `bash(git status)` | 恰好是 `git status` |
 | `write_file(src/**)` | `src/` 下任意层级的文件（`*` 不跨目录，`**` 跨目录） |
 | `edit_file(*.md)` | 工作目录下的 Markdown 文件 |
 | `web_fetch(domain:go.dev)` | 抓取 `go.dev` 域名 |
 | `mcp__github__*` | GitHub MCP 服务器的全部工具 |
 
+**bash 命令先拆成子命令再匹配**（按 `&&`、`||`、`;`、`|`、`&`、换行、子 shell 括号拆分，尊重引号与转义）：
+
+- `allow` 规则必须覆盖**每一个**子命令：`bash(go test:*)` 不再放行 `go test ./... && rm -rf ~`；
+  多条规则可以共同覆盖（`go vet ./... && go test ./...` 由 `bash(go vet:*)` 与 `bash(go test:*)` 一起放行）；
+  带写文件重定向（`> out.txt`）或变量赋值前缀（`GOFLAGS=... go test`）的命令不会被普通规则放行；
+- `deny` / `ask` 规则命中**任意一个**子命令即生效，包括 `$(...)`、反引号、`eval`、`sh -c '...'`、`sudo` / `xargs` / `timeout` 等包装命令、
+  `find -exec` 内部的命令，命令名按 basename 比较（`/bin/rm -rf x` 同样被 `bash(rm -rf:*)` 拒绝）；
+- 无法安全分析的结构（命令替换、`eval`、heredoc、变量作命令名、`for` / `case`、不配对的引号）不会被 allow 规则放行，至少需要询问。
+
 判定优先级：**deny > plan 模式 > ask > allow > 本会话已允许 > 模式默认**。
-审批时选择"本会话总是允许"会记住该工具，之后不再询问（`ask` 规则仍然生效）。
+审批时选择"本会话总是允许"**只对当前会话生效**（`goagent serve` 下不会影响其它会话；子 Agent 的审批记在父会话上）：
+普通工具记住工具名；bash 记住每个子命令的前缀（批准 `go test ./...` 后 `go test -run X` 不再询问，`rm -rf build` 仍需确认）。
+
+plan 模式允许委派给"工具全部只读"的子 Agent（如内置的 `explore`）：`task` 工具按参数判断这次委派是否只读，
+子 Agent 内部的每次工具调用仍然单独经过权限检查。
 
 ## Skills
 
@@ -598,14 +666,39 @@ goagent 从工作目录逐级向上（直到 git 仓库根目录）查找 `AGENT
 
 - **长期记忆**：Agent 通过 `memory_save` / `memory_search` / `memory_delete` 管理跨会话的笔记，
   每条记忆是 `.goagent/memory/` 下的一个 Markdown 文件，`MEMORY.md` 是索引（会注入系统提示词）。人类可以直接查看和编辑。
-- **会话持久化**：每个会话保存为 `.goagent/sessions/<id>.json`（临时文件 + rename 原子写入），用 `-resume` 或 `/resume` 继续。
+- **会话持久化**：每个会话保存为 `.goagent/sessions/<id>.json`（临时文件 + fsync + rename 原子写入），用 `-resume` 或 `/resume` 继续。
+  保存的历史永远是"配对完整"的：工具执行期间保存时，尚未得到结果的调用先以"被中断"的错误结果占位；
+  加载旧版本写入的、以悬空 `tool_use` 结尾的会话时，以及每次运行开始前，也会自动补齐结果，进程被 `kill -9` 后恢复的会话不会被 API 拒绝。
 - **自动压缩**：估算 token 超过 `context_window × threshold` 时，把较早的对话交给模型生成结构化摘要，
   保留最近几轮原文；切分点总是落在用户输入上，不会拆开工具调用与其结果。也可以用 `/compact` 手动触发。
 
 ## Trace 查看
 
-每次运行都会生成一棵 Span 树：`agent.run` → `llm.call` / `tool.*` / `subagent.*` / `context.compact`，
-记录耗时、token 用量、首 token 延迟（`ttft_ms`）、输入输出摘要与错误。
+每次运行都会生成一棵 Span 树：`agent.run` → `llm.call` / `tool.*` / `subagent.*` / `context.compact`。
+`llm.call` 记录**模型调用的完整原始数据**，工具 Span 记录完整输入输出：
+
+| 属性 | 类型 | 说明 |
+| --- | --- | --- |
+| `llm.request.params` | 对象 | 全部请求参数：`model`、`max_tokens`、`temperature`、`top_p`、`top_k`、`thinking_budget`、`stop_sequences`、`stream`、`system`、`tools`（完整工具定义）、`extra_headers`、`extra_body`、`message_count` |
+| `llm.request.url` / `llm.request.method` | 字符串 | 实际请求地址与方法 |
+| `llm.request.headers` | 对象 | 实际发出的请求头（`authorization`、`x-api-key` 等凭据显示为 `[REDACTED]`） |
+| `llm.request.body` | 字符串 | 发给厂商的**原生请求体**，与发送的字节完全一致 |
+| `llm.request.stream` | 布尔 | 是否流式 |
+| `llm.response.status` / `llm.response.headers` | 数字 / 对象 | HTTP 状态码与响应头 |
+| `llm.response.body` | 字符串 | 非流式响应体，或错误响应体 |
+| `llm.response.raw_stream` | 字符串 | 流式响应的**完整原始 SSE 文本**（`event:` / `data:` 行原样保留） |
+| `llm.response.message` | 对象 | 组装后的最终消息 `{model, stop_reason, message}` |
+| `llm.response.bytes` / `llm.response.latency_ms` / `llm.response.ttfb_ms` | 数字 | 响应体真实字节数、最后一次尝试的耗时与首字节时间 |
+| `llm.usage` | 对象 | `input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens` |
+| `llm.latency_ms` / `llm.retries` / `llm.attempts` | 数字 / 数字 / 数组 | 含重试的总耗时、重试次数、每次尝试的 `{attempt, status, error, latency_ms, start, response_body}` |
+| `tool.input` / `tool.output` | 字符串 | 工具的完整参数 JSON 与完整输出（回填给模型前） |
+| `tool.output_bytes` / `tool.output_truncated_for_model` / `tool.is_error` / `tool.duration_ms` | — | 输出大小、回填给模型时是否被截断、是否出错、耗时 |
+| `trace.truncated` | 字符串数组 | 超过 `trace.max_field_bytes`（默认 4MB）被截断的属性名；被截断的文本末尾带 `…[已截断：保留前 N 字节，共 M 字节]` |
+
+兼容旧版的简要属性（`input_tokens`、`output_tokens`、`stop_reason`、`ttft_ms`、`output`、`tool_calls`）仍然保留。
+密钥不会进入 Trace：配置中的 API Key、MCP 令牌、敏感请求头原文以及 `sk-…`、`ghp_…`、`AKIA…` 等常见格式都会被替换为 `[REDACTED]`。
+SSE 中的 `span_start` / `span_end` 事件携带轻量快照（超过 16KB 的属性只保留 2KB 预览，并列在 `trace.omitted` 中），
+完整内容用 `GET /v1/traces/{id}/tree` 或 `/v1/traces/{id}/spans/{span_id}` 获取。
 
 ```bash
 goagent trace                                   # 查看最新的 trace 文件
@@ -624,8 +717,10 @@ goagent trace .goagent/traces/20261027.jsonl    # 查看指定文件
 ```
 
 - 交互模式下输入 `/trace` 查看本会话的 trace；HTTP 接口见 `/v1/traces`。
+- Trace 文件按天滚动（`.goagent/traces/YYYYMMDD.jsonl`），长期运行的服务跨天后自动写入新文件。
 - JSONL 文件每行一个 Span，可以直接用 `jq` 分析，例如找出最慢的工具调用：
   `jq -s 'map(select(.kind=="tool")) | sort_by(-.duration_ms) | .[:5] | .[] | {name, duration_ms}' .goagent/traces/*.jsonl`
+- 查看某次模型调用的原始请求体：`jq -r 'select(.kind=="llm") | .attrs["llm.request.body"]' .goagent/traces/20261027.jsonl | head -1 | jq .`
 
 ## 作为库使用
 
@@ -673,7 +768,8 @@ a, err := app.New(ctx, cfg, app.Options{
 	// Provider: llm.NewMock(...),         // 测试时注入 Mock
 })
 defer a.Close()
-res, err := a.Agent.Run(ctx, a.NewSession(), "任务", sink)
+res, err := a.Run(ctx, a.NewSession(), "任务", sink) // 使用当前配置快照；a.Agent() 返回当前版本的 Agent
+// a.Reload(ctx) 立即重新加载配置；Options{Watch: true} 开启自动热更新
 ```
 
 更多示例（都可以直接 `go run`，没有 API Key 时自动使用 Mock 模型）：
@@ -716,6 +812,7 @@ CI（[.github/workflows/ci.yml](.github/workflows/ci.yml)）会执行 gofmt 检�
 ## 路线图
 
 - [x] Agent Loop、流式输出、并行工具、权限、Hooks、记忆与压缩、Skills、子 Agent、MCP、Trace、HTTP/SSE、CLI
+- [x] 配置驱动 + 热更新（模型、参数、提示词、工具绑定、技能、子 Agent）、完整的模型调用原始 Trace（v0.1.1）
 - [ ] 图片等多模态输入（Anthropic image 块 / OpenAI image_url）
 - [ ] Anthropic 提示词缓存（`cache_control`）与 OpenAI Responses API
 - [ ] MCP 资源（resources）与提示词（prompts）、OAuth 授权

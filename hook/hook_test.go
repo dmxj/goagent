@@ -111,6 +111,15 @@ func TestCommandHandler(t *testing.T) {
 			}
 		})
 	}
+	t.Run("环境变量过滤", func(t *testing.T) {
+		t.Setenv("GOAGENT_API_KEY", "sk-leak")
+		t.Setenv("ANTHROPIC_API_KEY", "sk-ant-leak")
+		h := CommandHandler(Config{Command: `echo "[$GOAGENT_API_KEY][$ANTHROPIC_API_KEY][$GOAGENT_HOOK_EVENT]"`, Timeout: 10}, dir)
+		out, err := h(context.Background(), &Input{Event: Stop})
+		if err != nil || out == nil || out.AdditionalContext != "[][][Stop]" {
+			t.Errorf("命令钩子不应看到密钥：out=%+v err=%v", out, err)
+		}
+	})
 	t.Run("超时", func(t *testing.T) {
 		h := CommandHandler(Config{Command: "sleep 10", Timeout: 1}, dir)
 		if _, err := h(context.Background(), &Input{Event: Stop}); err == nil {

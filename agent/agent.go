@@ -33,8 +33,20 @@ type Agent struct {
 	Model       string
 	MaxTokens   int
 	Temperature *float64
+	TopP        *float64
+	TopK        int
 	// ThinkingBudget > 0 时开启扩展思考。
 	ThinkingBudget int
+	// StopSequences 是停止序列。
+	StopSequences []string
+	// NoStream 为 true 时使用非流式接口调用模型。
+	NoStream bool
+	// ExtraHeaders 是每次模型请求附加的 HTTP 头。
+	ExtraHeaders map[string]string
+	// ExtraBody 合并进厂商原生请求体（厂商特有参数）。
+	ExtraBody map[string]any
+	// Version 标识这个 Agent 所用配置的版本（配置热更新时递增），会写进 run_start 事件与 Trace。
+	Version string
 	// Prompt 在每次调用模型前生成系统提示词（可以动态包含记忆索引、当前工具等）。
 	// 未设置时使用 System。
 	Prompt PromptBuilder
@@ -49,6 +61,9 @@ type Agent struct {
 	Store       session.Store
 
 	WorkDir string
+	// States 保存会话级运行时状态。配置热更新会创建新的 Agent，多个版本共享同一个 States，
+	// 运行中标志、插话队列、文件访问记录不会因为换了配置而丢失。nil 时自动创建。
+	States *States
 	// MaxTurns 是单次 Run 中调用模型的最大轮数，防止死循环。
 	MaxTurns int
 	// ToolTimeout 是单个工具调用的超时。
@@ -60,9 +75,24 @@ type Agent struct {
 	// KeepThinking 为 true 时在历史中保留无签名的思考块（部分网关需要）。
 	KeepThinking bool
 
-	states   sync.Map // sessionID -> *sessionState
 	initOnce sync.Once
 }
+
+// States 是按会话隔离的运行时状态表，可以被多个 Agent 共享。
+type States struct {
+	m sync.Map // sessionID -> *sessionState
+}
+
+// NewStates 创建会话状态表。
+func NewStates() *States { return &States{} }
+
+func (s *States) get(id string) *sessionState {
+	v, _ := s.m.LoadOrStore(id, &sessionState{files: tool.NewFileTracker(), values: &sync.Map{}})
+	return v.(*sessionState)
+}
+
+// Forget 删除某会话的运行时状态（会话被删除时调用）。
+func (s *States) Forget(id string) { s.m.Delete(id) }
 
 // sessionState 是会话级的运行时状态（不持久化）。
 type sessionState struct {
@@ -74,8 +104,8 @@ type sessionState struct {
 }
 
 func (a *Agent) state(id string) *sessionState {
-	v, _ := a.states.LoadOrStore(id, &sessionState{files: tool.NewFileTracker(), values: &sync.Map{}})
-	return v.(*sessionState)
+	a.defaults()
+	return a.States.get(id)
 }
 
 // Files 返回某会话的文件访问记录。
@@ -156,6 +186,9 @@ func (a *Agent) applyDefaults() {
 	if a.Tools == nil {
 		a.Tools = tool.NewRegistry()
 	}
+	if a.States == nil {
+		a.States = NewStates()
+	}
 }
 
 // Run 处理一条用户输入，直到模型给出最终回答（不再调用工具）。
@@ -178,6 +211,7 @@ func (a *Agent) Run(ctx context.Context, sess *session.Session, input string, si
 	}()
 
 	ctx = withPath(ctx, a.Name)
+	ctx = withRootSession(ctx, sess.ID)
 	path := AgentPath(ctx)
 	if parentSink := SinkFrom(ctx); sink == nil {
 		sink = parentSink
@@ -209,8 +243,9 @@ func (a *Agent) Run(ctx context.Context, sess *session.Session, input string, si
 	})
 
 	ctx, span := a.Tracer.Start(ctx, "agent.run", trace.KindAgent, map[string]any{
-		"agent": path, "session_id": sess.ID, "model": a.Model, "input": clip(input, 2000),
+		"agent": path, "session_id": sess.ID, "model": a.Model, "config_version": a.Version,
 	})
+	span.SetText("input", input)
 	res = &Result{TraceID: span.TraceID}
 	defer func() {
 		if r := recover(); r != nil {
@@ -222,16 +257,24 @@ func (a *Agent) Run(ctx context.Context, sess *session.Session, input string, si
 			emit(Event{Type: EventError, Error: err.Error()})
 		}
 		span.SetAttr("turns", res.Turns)
-		span.SetAttr("output", clip(res.Text, 2000))
+		span.SetAttr("stop_reason", res.StopReason)
+		span.SetText("output", res.Text)
 		span.Finish()
-		emit(Event{Type: EventSpanEnd, Span: ptr(span.Snapshot())})
+		emit(Event{Type: EventSpanEnd, Span: lightSpan(span)})
 		if a.Store != nil {
 			_ = a.Store.Save(sess)
 		}
 		emit(Event{Type: EventRunEnd, Text: res.Text, Usage: &res.Usage, Data: map[string]any{"turns": res.Turns, "stop_reason": res.StopReason, "trace_id": res.TraceID}})
 	}()
-	emit(Event{Type: EventSpanStart, Span: ptr(span.Snapshot())})
-	emit(Event{Type: EventRunStart, Text: input, Data: map[string]any{"trace_id": span.TraceID, "model": a.Model}})
+	emit(Event{Type: EventSpanStart, Span: lightSpan(span)})
+	emit(Event{Type: EventRunStart, Text: input, Data: map[string]any{"trace_id": span.TraceID, "model": a.Model, "config_version": a.Version}})
+
+	// 历史中可能有悬空的工具调用（例如上一次运行在执行工具时崩溃，或会话来自旧版本），
+	// 直接发给模型会被拒绝：先补上"被中断"的结果
+	if sess.Repair() {
+		emit(Event{Type: EventLog, Text: "会话历史中有未完成的工具调用，已补上“被中断”的结果"})
+		span.AddEvent("session_repaired", nil)
+	}
 
 	// ① SessionStart 钩子（仅会话的第一条输入）与 UserPromptSubmit 钩子：
 	// 可以拦截输入，或补充上下文（如注入当前 git 状态）
@@ -336,6 +379,10 @@ func (a *Agent) Run(ctx context.Context, sess *session.Session, input string, si
 		// ⑥ 执行工具并把结果作为一条 user 消息回填
 		results := a.execTools(ctx, sess, calls, turn, emit)
 		sess.Append(llm.Message{Role: llm.RoleUser, Content: results})
+		// 工具结果回填后立即保存：否则下一次模型调用期间崩溃，已经执行过的工具在恢复后会显示为"被中断"
+		if a.Store != nil {
+			_ = a.Store.Save(sess)
+		}
 	}
 }
 
@@ -366,31 +413,47 @@ func (a *Agent) callModel(ctx context.Context, sess *session.Session, system str
 	if !a.KeepThinking {
 		history = stripUnsignedThinking(history)
 	}
-	req := &llm.Request{
+	req := a.newRequest(system, history)
+	ctx, span := a.Tracer.Start(ctx, "llm.call", trace.KindLLM, map[string]any{
+		"model": a.Model, "turn": turn, "messages": len(history), "tools": len(req.Tools), "provider": a.Provider.Name(),
+	})
+	span.SetJSON(AttrLLMParams, requestParams(req))
+	defer func() { span.Finish(); emit(Event{Type: EventSpanEnd, Turn: turn, Span: lightSpan(span)}) }()
+	emit(Event{Type: EventSpanStart, Turn: turn, Span: lightSpan(span)})
+
+	// 重试通知通过 ctx 传递：无论 RetryProvider 外面还包了几层 Provider 都能收到
+	retries := 0
+	ctx = llm.WithRetryNotify(ctx, func(attempt int, delay time.Duration, err error) {
+		retries++
+		span.AddEvent("retry", map[string]any{"attempt": attempt, "delay_ms": delay.Milliseconds(), "error": err.Error()})
+		emit(Event{Type: EventRetry, Turn: turn, Text: fmt.Sprintf("模型调用失败，%s 后第 %d 次重试：%v", delay.Round(time.Millisecond), attempt, err)})
+	})
+	start := time.Now()
+	ctx, exchanges := a.recordExchanges(ctx)
+	resp, err := a.stream(ctx, a.Provider, req, span, turn, emit)
+	span.SetAttr(AttrLLMLatency, time.Since(start).Milliseconds())
+	span.SetAttr(AttrLLMRetries, retries)
+	recordExchangeAttrs(span, exchanges())
+	return resp, err
+}
+
+// newRequest 根据 Agent 配置组装一次模型请求。
+func (a *Agent) newRequest(system string, history []llm.Message) *llm.Request {
+	return &llm.Request{
 		Model:          a.Model,
 		System:         system,
 		Messages:       history,
 		Tools:          a.Tools.Specs(),
 		MaxTokens:      a.MaxTokens,
 		Temperature:    a.Temperature,
+		TopP:           a.TopP,
+		TopK:           a.TopK,
 		ThinkingBudget: a.ThinkingBudget,
+		StopSequences:  a.StopSequences,
+		NoStream:       a.NoStream,
+		Headers:        a.ExtraHeaders,
+		ExtraBody:      a.ExtraBody,
 	}
-	ctx, span := a.Tracer.Start(ctx, "llm.call", trace.KindLLM, map[string]any{
-		"model": a.Model, "turn": turn, "messages": len(history), "tools": len(req.Tools), "provider": a.Provider.Name(),
-	})
-	defer func() { span.Finish(); emit(Event{Type: EventSpanEnd, Turn: turn, Span: ptr(span.Snapshot())}) }()
-	emit(Event{Type: EventSpanStart, Turn: turn, Span: ptr(span.Snapshot())})
-
-	if rp, ok := a.Provider.(*llm.RetryProvider); ok && rp.OnRetry == nil {
-		// 每次调用复制一份，避免并发修改共享的 OnRetry
-		cp := *rp
-		cp.OnRetry = func(attempt int, delay time.Duration, err error) {
-			span.AddEvent("retry", map[string]any{"attempt": attempt, "delay_ms": delay.Milliseconds(), "error": err.Error()})
-			emit(Event{Type: EventRetry, Turn: turn, Text: fmt.Sprintf("模型调用失败，%s 后第 %d 次重试：%v", delay.Round(time.Millisecond), attempt, err)})
-		}
-		return a.stream(ctx, &cp, req, span, turn, emit)
-	}
-	return a.stream(ctx, a.Provider, req, span, turn, emit)
 }
 
 func (a *Agent) stream(ctx context.Context, p llm.Provider, req *llm.Request, span *trace.Span, turn int, emit func(Event)) (*llm.Response, error) {
@@ -420,7 +483,9 @@ func (a *Agent) stream(ctx context.Context, p llm.Provider, req *llm.Request, sp
 	span.SetAttr("cache_read_tokens", resp.Usage.CacheReadTokens)
 	span.SetAttr("stop_reason", resp.StopReason)
 	span.SetAttr("ttft_ms", firstToken.Milliseconds())
-	span.SetAttr("output", clip(resp.Message.Text(), 4000))
+	span.SetText("output", resp.Message.Text())
+	span.SetJSON(AttrLLMUsage, resp.Usage)
+	span.SetJSON(AttrLLMResponseMessage, map[string]any{"model": resp.Model, "stop_reason": resp.StopReason, "message": resp.Message})
 	if n := len(resp.Message.ToolUses()); n > 0 {
 		var names []string
 		for _, c := range resp.Message.ToolUses() {
@@ -434,11 +499,13 @@ func (a *Agent) stream(ctx context.Context, p llm.Provider, req *llm.Request, sp
 // compact 执行上下文压缩。
 func (a *Agent) compact(ctx context.Context, sess *session.Session, emit func(Event)) {
 	ctx, span := a.Tracer.Start(ctx, "context.compact", trace.KindCompact, nil)
-	emit(Event{Type: EventSpanStart, Span: ptr(span.Snapshot())})
-	defer func() { span.Finish(); emit(Event{Type: EventSpanEnd, Span: ptr(span.Snapshot())}) }()
+	emit(Event{Type: EventSpanStart, Span: lightSpan(span)})
+	defer func() { span.Finish(); emit(Event{Type: EventSpanEnd, Span: lightSpan(span)}) }()
 	_, _ = a.Hooks.Run(ctx, &hook.Input{Event: hook.PreCompact, SessionID: sess.ID, WorkDir: a.WorkDir})
 	before := memory.EstimateMessages(sess.History())
+	ctx, exchanges := a.recordExchanges(ctx)
 	msgs, summary, err := a.Compactor.Compact(ctx, sess.History(), sess.Summary)
+	recordExchangeAttrs(span, exchanges())
 	if err != nil {
 		span.Fail(err)
 		emit(Event{Type: EventLog, Text: "上下文压缩失败：" + err.Error()})
@@ -521,9 +588,10 @@ func (a *Agent) execOne(ctx context.Context, sess *session.Session, call llm.Con
 		input = json.RawMessage("{}")
 	}
 	ctx, span := a.Tracer.Start(ctx, "tool."+call.Name, trace.KindTool, map[string]any{
-		"tool": call.Name, "call_id": call.ID, "input": clip(string(input), 4000),
+		"tool": call.Name, "call_id": call.ID, AttrToolName: call.Name, AttrToolCallID: call.ID,
 	})
-	emit(Event{Type: EventSpanStart, Turn: turn, Span: ptr(span.Snapshot())})
+	span.SetText(AttrToolInput, string(input))
+	emit(Event{Type: EventSpanStart, Turn: turn, Span: lightSpan(span)})
 	var result *tool.Result
 	defer func() {
 		if r := recover(); r != nil {
@@ -535,8 +603,14 @@ func (a *Agent) execOne(ctx context.Context, sess *session.Session, call llm.Con
 		}
 		block = llm.ContentBlock{Type: llm.BlockToolResult, ToolUseID: call.ID, Content: content, IsError: result.IsError}
 		dur := time.Since(start)
-		span.SetAttr("output", clip(content, 4000))
+		// Trace 里记录工具的完整输出（受 Tracer 大小上限约束），并标明回填给模型时是否被截断
+		span.SetText(AttrToolInput, string(input))
+		span.SetText(AttrToolOutput, result.Content)
+		span.SetAttr(AttrToolOutputBytes, len(result.Content))
+		span.SetAttr(AttrToolModelTruncated, len(content) != len(result.Content) && result.Content != "")
 		span.SetAttr("is_error", result.IsError)
+		span.SetAttr(AttrToolIsError, result.IsError)
+		span.SetAttr(AttrToolDuration, dur.Milliseconds())
 		for k, v := range result.Meta {
 			span.SetAttr("meta."+k, v)
 		}
@@ -544,7 +618,7 @@ func (a *Agent) execOne(ctx context.Context, sess *session.Session, call llm.Con
 			span.Fail(errors.New(clip(content, 300)))
 		}
 		span.Finish()
-		emit(Event{Type: EventSpanEnd, Turn: turn, Span: ptr(span.Snapshot())})
+		emit(Event{Type: EventSpanEnd, Turn: turn, Span: lightSpan(span)})
 		emit(Event{Type: EventToolResult, Turn: turn, Tool: &ToolEvent{
 			ID: call.ID, Name: call.Name, Input: input, Output: content, IsError: result.IsError, Meta: result.Meta, DurationMS: dur.Milliseconds(),
 		}})
@@ -579,8 +653,9 @@ func (a *Agent) execOne(ctx context.Context, sess *session.Session, call llm.Con
 
 	// 权限检查
 	if a.Permissions != nil {
-		info := t.Info()
-		if err := a.Permissions.Check(ctx, permission.Request{Tool: call.Name, Input: input, ReadOnly: info.ReadOnly, CallID: call.ID}); err != nil {
+		// 是否只读可能取决于参数（例如 task 委派给只读子 Agent），由工具自己判断
+		req := permission.Request{Tool: call.Name, Input: input, ReadOnly: tool.IsReadOnly(t, input), CallID: call.ID, SessionID: permissionSession(ctx, sess.ID)}
+		if err := a.Permissions.Check(ctx, req); err != nil {
 			result = tool.Errorf("%v", err)
 			span.AddEvent("permission_denied", map[string]any{"reason": err.Error()})
 			return
@@ -589,8 +664,11 @@ func (a *Agent) execOne(ctx context.Context, sess *session.Session, call llm.Con
 
 	tctx, cancel := context.WithTimeout(ctx, a.ToolTimeout)
 	defer cancel()
-	r, err := t.Run(tctx, &tool.Call{ID: call.ID, Name: call.Name, Input: input, Env: env})
+	r, err, abandoned := runTool(tctx, t, &tool.Call{ID: call.ID, Name: call.Name, Input: input, Env: env})
 	switch {
+	case abandoned:
+		result = tool.Errorf("工具 %s 在超时或取消后 %s 内仍未返回，已放弃等待（它可能仍在后台运行）", call.Name, abandonGrace)
+		span.AddEvent("tool_abandoned", nil)
 	case err != nil:
 		result = tool.Errorf("工具执行出错：%v", err)
 	case r == nil:
@@ -598,7 +676,7 @@ func (a *Agent) execOne(ctx context.Context, sess *session.Session, call llm.Con
 	default:
 		result = r
 	}
-	if errors.Is(tctx.Err(), context.DeadlineExceeded) {
+	if errors.Is(tctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
 		result.Content += fmt.Sprintf("\n[工具执行超时（%s）]", a.ToolTimeout)
 		result.IsError = true
 	}
@@ -612,6 +690,40 @@ func (a *Agent) execOne(ctx context.Context, sess *session.Session, call llm.Con
 		result.IsError = true
 	}
 	return
+}
+
+// abandonGrace 是超时 / 取消后等待工具自行返回的宽限时间。
+var abandonGrace = 5 * time.Second
+
+// runTool 在独立 goroutine 中执行工具：工具正常返回时直接取结果；超时或取消后再等 abandonGrace，
+// 仍不返回（不尊重 ctx 的工具）就放弃等待，避免整个 Agent 卡死。被放弃的 goroutine 会在工具
+// 最终返回时退出，结果被丢弃；panic 会被转换为错误。
+func runTool(ctx context.Context, t tool.Tool, call *tool.Call) (r *tool.Result, err error, abandoned bool) {
+	type out struct {
+		r   *tool.Result
+		err error
+	}
+	ch := make(chan out, 1)
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				ch <- out{nil, fmt.Errorf("工具 %s 发生 panic：%v", call.Name, p)}
+			}
+		}()
+		r, err := t.Run(ctx, call)
+		ch <- out{r, err}
+	}()
+	select {
+	case o := <-ch:
+		return o.r, o.err, false
+	case <-ctx.Done():
+	}
+	select {
+	case o := <-ch:
+		return o.r, o.err, false
+	case <-time.After(abandonGrace):
+		return nil, nil, true
+	}
 }
 
 // sanitizeToolInputs 把消息中不是合法 JSON 的工具参数替换为 {}。

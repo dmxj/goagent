@@ -323,4 +323,16 @@ func TestExampleConfig(t *testing.T) {
 	if _, err := permission.NewChecker(c.Permissions, nil); err != nil {
 		t.Errorf("示例权限规则无效：%v", err)
 	}
+	if c.SystemPromptFile == "" || c.Params.TopP == nil || c.Tools.Options["bash"].TimeoutSec != 300 || len(c.Skills.Dirs) != 2 || !c.ReloadEnabled() {
+		t.Errorf("示例配置应覆盖新的配置项：%+v", c.Tools)
+	}
+	// 示例引用的提示词文件就在仓库里：把它复制到临时项目后整份配置应通过静态校验
+	prompt, err := os.ReadFile(filepath.Join("..", ".goagent", "prompts", "system.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeJSON(t, filepath.Join(work, ".goagent", "prompts", "system.md"), string(prompt))
+	if err := c.ValidateStatic(); err != nil {
+		t.Errorf("示例配置静态校验失败：%v", err)
+	}
 }

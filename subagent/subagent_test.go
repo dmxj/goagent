@@ -13,8 +13,10 @@ import (
 	"github.com/dmxj/goagent/agent"
 	"github.com/dmxj/goagent/hook"
 	"github.com/dmxj/goagent/llm"
+	"github.com/dmxj/goagent/permission"
 	"github.com/dmxj/goagent/session"
 	"github.com/dmxj/goagent/tool"
+	"github.com/dmxj/goagent/trace"
 )
 
 func TestLoad(t *testing.T) {
@@ -260,5 +262,120 @@ func TestRepoAgents(t *testing.T) {
 	d := defs[0]
 	if d.Name != "test-runner" || d.MaxTurns != 25 || strings.Join(d.Tools, ",") != "bash,read_file,grep,glob" || d.Prompt == "" {
 		t.Errorf("test-runner 定义解析错误：%+v", d)
+	}
+}
+
+// TestPlanModeDelegatesToReadOnlySubagent：plan 模式允许委派只读的 explore，但拒绝 general-purpose；
+// 子 Agent 自身的工具仍受权限约束。
+func TestPlanModeDelegatesToReadOnlySubagent(t *testing.T) {
+	perm, _ := permission.NewChecker(permission.Config{Mode: permission.ModePlan}, permission.AutoDeny)
+	mock := &llm.MockProvider{Handler: func(req *llm.Request) (llm.Message, error) {
+		first := req.Messages[0].Text()
+		if strings.HasPrefix(first, "子任务") {
+			if len(req.Messages) == 1 {
+				return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.ToolCall("", "read_file", readArgs{"a.go"})}}, nil
+			}
+			return llm.AssistantText("只读汇报"), nil
+		}
+		if len(req.Messages) == 1 {
+			return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+				llm.ToolCall("e", "task", map[string]string{"description": "探索", "prompt": "子任务 E", "agent": "explore"}),
+				llm.ToolCall("g", "task", map[string]string{"description": "改代码", "prompt": "子任务 G", "agent": "general-purpose"}),
+			}}, nil
+		}
+		var parts []string
+		for _, b := range req.Messages[len(req.Messages)-1].Content {
+			parts = append(parts, b.Content)
+		}
+		return llm.AssistantText(strings.Join(parts, " | ")), nil
+	}}
+	tracer := trace.New()
+	parent := &agent.Agent{Name: "main", Provider: mock, Model: "m", Tools: tool.NewRegistry(readTool(), writeTool()), Permissions: perm, Tracer: tracer}
+	task := TaskTool(parent, Builtin())
+	parent.Tools.Register(task)
+
+	if !tool.IsReadOnly(task, json.RawMessage(`{"agent":"explore","prompt":"x"}`)) {
+		t.Errorf("委派给 explore 应视为只读")
+	}
+	if tool.IsReadOnly(task, json.RawMessage(`{"prompt":"x"}`)) || tool.IsReadOnly(task, json.RawMessage(`{"agent":"general-purpose"}`)) {
+		t.Errorf("委派给 general-purpose 不是只读")
+	}
+
+	var mu sync.Mutex
+	var spanStarts, spanEnds []string
+	res, err := parent.Run(context.Background(), session.New(), "规划一下", func(ev agent.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		if ev.Span != nil && ev.Span.Kind == trace.KindSubagent {
+			if ev.Type == agent.EventSpanStart {
+				spanStarts = append(spanStarts, ev.Span.Name)
+			} else if ev.Type == agent.EventSpanEnd {
+				spanEnds = append(spanEnds, ev.Span.Name)
+				if ev.Span.Attrs["input_tokens"] == nil || ev.Span.Attrs["output_tokens"] == nil {
+					t.Errorf("subagent Span 应记录 input/output tokens：%v", ev.Span.Attrs)
+				}
+			}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Text, "只读汇报") || !strings.Contains(res.Text, "plan") {
+		t.Errorf("explore 应在 plan 模式下执行，general-purpose 应被拒绝：%s", res.Text)
+	}
+	if len(spanStarts) != 1 || spanStarts[0] != "subagent.explore" || len(spanEnds) != 1 {
+		t.Errorf("subagent Span 应实时发出 span_start / span_end：start=%v end=%v", spanStarts, spanEnds)
+	}
+}
+
+func TestMergeInheritsAndProfile(t *testing.T) {
+	merged := Merge(Builtin(), []Definition{{Name: "explore", Description: "只改描述"}})
+	var ex Definition
+	for _, d := range merged {
+		if d.Name == "explore" {
+			ex = d
+		}
+	}
+	if ex.Description != "只改描述" || ex.MaxTurns != 30 || len(ex.Tools) != 4 || !strings.Contains(ex.Prompt, "代码库探索专家") {
+		t.Errorf("覆盖时未写出的字段应继承内置定义：%+v", ex)
+	}
+
+	parentMock := llm.NewMock(llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+		llm.ToolCall("t", "task", map[string]string{"prompt": "子任务", "agent": "cheap"}),
+	}}, llm.AssistantText("done"))
+	childMock := llm.NewMock(llm.AssistantText("来自便宜模型"))
+	parent := &agent.Agent{Name: "main", Provider: parentMock, Model: "big", Tools: tool.NewRegistry(readTool())}
+	defs := []Definition{{Name: "cheap", Description: "d", Profile: "deepseek", Tools: []string{"read_file"}, Prompt: "p"}}
+	parent.Tools.Register(TaskToolWith(parent, defs, Options{Resolve: func(profile string) (llm.Provider, string, error) {
+		if profile != "deepseek" {
+			t.Errorf("profile = %s", profile)
+		}
+		return childMock, "deepseek-chat", nil
+	}}))
+	if _, err := parent.Run(context.Background(), session.New(), "go", nil); err != nil {
+		t.Fatal(err)
+	}
+	if childMock.Calls() != 1 || childMock.Requests[0].Model != "deepseek-chat" {
+		t.Errorf("子 Agent 应使用 profile 解析出的 Provider 与模型：calls=%d", childMock.Calls())
+	}
+	// 没有 Resolve 时报工具错误
+	parent2 := &agent.Agent{Name: "main", Provider: llm.NewMock(llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+		llm.ToolCall("t", "task", map[string]string{"prompt": "x", "agent": "cheap"})}}, llm.AssistantText("ok")), Model: "m", Tools: tool.NewRegistry(readTool())}
+	parent2.Tools.Register(TaskTool(parent2, defs))
+	rec := []agent.Event{}
+	var mu sync.Mutex
+	_, _ = parent2.Run(context.Background(), session.New(), "go", func(ev agent.Event) {
+		mu.Lock()
+		rec = append(rec, ev)
+		mu.Unlock()
+	})
+	found := false
+	for _, ev := range rec {
+		if ev.Type == agent.EventToolResult && strings.Contains(ev.Tool.Output, "profile") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("没有 Resolve 时应返回 profile 相关的工具错误")
 	}
 }

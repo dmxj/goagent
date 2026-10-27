@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -72,13 +73,7 @@ type oaChunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptTokens        int `json:"prompt_tokens"`
-		CompletionTokens    int `json:"completion_tokens"`
-		PromptTokensDetails struct {
-			CachedTokens int `json:"cached_tokens"`
-		} `json:"prompt_tokens_details"`
-	} `json:"usage"`
+	Usage *oaUsage `json:"usage"`
 }
 
 // toOpenAIMessages 把通用消息转换为 OpenAI 格式：
@@ -134,18 +129,24 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 	return out
 }
 
-func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, onEvent func(StreamEvent)) (*Response, error) {
+// BuildRequestBody 返回发给 OpenAI 兼容服务的原生请求体（便于测试与调试）。
+func (p *OpenAIProvider) BuildRequestBody(req *Request) ([]byte, error) {
 	body := map[string]any{
-		"model":          req.Model,
-		"messages":       toOpenAIMessages(req.System, req.Messages),
-		"stream":         true,
-		"stream_options": map[string]any{"include_usage": true},
+		"model":    req.Model,
+		"messages": toOpenAIMessages(req.System, req.Messages),
+		"stream":   !req.NoStream,
+	}
+	if !req.NoStream {
+		body["stream_options"] = map[string]any{"include_usage": true}
 	}
 	if req.MaxTokens > 0 {
 		body["max_tokens"] = req.MaxTokens
 	}
 	if req.Temperature != nil {
 		body["temperature"] = *req.Temperature
+	}
+	if req.TopP != nil {
+		body["top_p"] = *req.TopP
 	}
 	if len(req.StopSequences) > 0 {
 		body["stop"] = req.StopSequences
@@ -162,7 +163,14 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, onEvent func(
 		}
 		body["tools"] = tools
 	}
-	buf, err := json.Marshal(body)
+	for k, v := range req.ExtraBody {
+		body[k] = v
+	}
+	return json.Marshal(body)
+}
+
+func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, onEvent func(StreamEvent)) (resp *Response, err error) {
+	buf, err := p.BuildRequestBody(req)
 	if err != nil {
 		return nil, err
 	}
@@ -171,38 +179,82 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, onEvent func(
 		return nil, err
 	}
 	hreq.Header.Set("content-type", "application/json")
-	hreq.Header.Set("accept", "text/event-stream")
+	if req.NoStream {
+		hreq.Header.Set("accept", "application/json")
+	} else {
+		hreq.Header.Set("accept", "text/event-stream")
+	}
 	if p.APIKey != "" {
 		hreq.Header.Set("authorization", "Bearer "+p.APIKey)
 	}
 	for k, v := range p.Headers {
 		hreq.Header.Set(k, v)
 	}
-	resp, err := p.Client.Do(hreq)
+	for k, v := range req.Headers {
+		hreq.Header.Set(k, v)
+	}
+	rec := startExchange(ctx, p.Name(), hreq, buf, !req.NoStream)
+	defer func() { rec.done(err) }()
+	hresp, err := p.Client.Do(hreq)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return nil, newAPIError(p.Name(), resp)
+	defer hresp.Body.Close()
+	rec.response(hresp)
+	if hresp.StatusCode/100 != 2 {
+		return nil, newAPIError(p.Name(), hresp)
 	}
+	if req.NoStream {
+		return p.decodeCompletion(rec.tee(hresp.Body, false), onEvent)
+	}
+	return p.readStream(rec.tee(hresp.Body, true), onEvent)
+}
 
-	emit := func(ev StreamEvent) {
-		if onEvent != nil {
-			onEvent(ev)
-		}
-	}
-	out := &Response{Message: Message{Role: RoleAssistant}}
-	var text, thinking strings.Builder
-	type partial struct {
-		id, name string
-		args     strings.Builder
-		started  bool
-	}
-	calls := map[int]*partial{}
-	finish := ""
+// oaCompletion 是非流式响应。
+type oaCompletion struct {
+	Model   string `json:"model"`
+	Choices []struct {
+		Message      oaMessage `json:"message"`
+		FinishReason string    `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *oaUsage `json:"usage"`
+}
 
-	err = ReadSSE(resp.Body, func(e SSEEvent) error {
+type oaUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+func (u *oaUsage) toUsage() Usage {
+	if u == nil {
+		return Usage{}
+	}
+	return Usage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens, CacheReadTokens: u.PromptTokensDetails.CachedTokens}
+}
+
+// decodeCompletion 解析非流式响应，并按流式的顺序补发事件。
+func (p *OpenAIProvider) decodeCompletion(r io.Reader, onEvent func(StreamEvent)) (*Response, error) {
+	var c oaCompletion
+	if err := json.NewDecoder(r).Decode(&c); err != nil {
+		return nil, fmt.Errorf("解析响应失败: %w", err)
+	}
+	a := newOAAssembler(onEvent)
+	a.out.Model = c.Model
+	a.out.Usage = c.Usage.toUsage()
+	for _, ch := range c.Choices {
+		text, _ := ch.Message.Content.(string)
+		a.delta(ch.Message.ReasoningContent, text, ch.Message.ToolCalls, ch.FinishReason)
+		break // 只取第一个候选
+	}
+	return a.finish(), nil
+}
+
+func (p *OpenAIProvider) readStream(r io.Reader, onEvent func(StreamEvent)) (*Response, error) {
+	a := newOAAssembler(onEvent)
+	err := ReadSSE(r, func(e SSEEvent) error {
 		if e.Data == "" || e.Data == "[DONE]" {
 			return nil
 		}
@@ -211,54 +263,91 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, onEvent func(
 			return fmt.Errorf("解析流式事件失败: %w", err)
 		}
 		if c.Model != "" {
-			out.Model = c.Model
+			a.out.Model = c.Model
 		}
 		if c.Usage != nil {
-			out.Usage = Usage{InputTokens: c.Usage.PromptTokens, OutputTokens: c.Usage.CompletionTokens, CacheReadTokens: c.Usage.PromptTokensDetails.CachedTokens}
+			a.out.Usage = c.Usage.toUsage()
 		}
 		for _, ch := range c.Choices {
-			if ch.Delta.ReasoningContent != "" {
-				thinking.WriteString(ch.Delta.ReasoningContent)
-				emit(StreamEvent{Type: EventThinkingDelta, Text: ch.Delta.ReasoningContent})
-			}
-			if ch.Delta.Content != "" {
-				text.WriteString(ch.Delta.Content)
-				emit(StreamEvent{Type: EventTextDelta, Text: ch.Delta.Content})
-			}
-			for i, tc := range ch.Delta.ToolCalls {
-				idx := i
-				if tc.Index != nil {
-					idx = *tc.Index
-				}
-				pc := calls[idx]
-				if pc == nil {
-					pc = &partial{}
-					calls[idx] = pc
-				}
-				if tc.ID != "" {
-					pc.id = tc.ID
-				}
-				if tc.Function.Name != "" {
-					pc.name += tc.Function.Name
-				}
-				if !pc.started && pc.name != "" {
-					pc.started = true
-					emit(StreamEvent{Type: EventToolUseStart, Index: idx, Block: &ContentBlock{Type: BlockToolUse, ID: pc.id, Name: pc.name}})
-				}
-				if tc.Function.Arguments != "" {
-					pc.args.WriteString(tc.Function.Arguments)
-					emit(StreamEvent{Type: EventToolUseDelta, Index: idx, Text: tc.Function.Arguments})
-				}
-			}
-			if ch.FinishReason != "" {
-				finish = ch.FinishReason
-			}
+			a.delta(ch.Delta.ReasoningContent, ch.Delta.Content, ch.Delta.ToolCalls, ch.FinishReason)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	return a.finish(), nil
+}
+
+// oaAssembler 把增量（或非流式的一次性结果）组装成完整消息。
+type oaAssembler struct {
+	emit           func(StreamEvent)
+	out            *Response
+	text, thinking strings.Builder
+	calls          map[int]*oaPartial
+	finishReason   string
+}
+
+type oaPartial struct {
+	id, name string
+	args     strings.Builder
+	started  bool
+}
+
+func newOAAssembler(onEvent func(StreamEvent)) *oaAssembler {
+	return &oaAssembler{
+		emit: func(ev StreamEvent) {
+			if onEvent != nil {
+				onEvent(ev)
+			}
+		},
+		out:   &Response{Message: Message{Role: RoleAssistant}},
+		calls: map[int]*oaPartial{},
+	}
+}
+
+func (a *oaAssembler) delta(reasoning, content string, toolCalls []oaToolCall, finish string) {
+	if reasoning != "" {
+		a.thinking.WriteString(reasoning)
+		a.emit(StreamEvent{Type: EventThinkingDelta, Text: reasoning})
+	}
+	if content != "" {
+		a.text.WriteString(content)
+		a.emit(StreamEvent{Type: EventTextDelta, Text: content})
+	}
+	for i, tc := range toolCalls {
+		idx := i
+		if tc.Index != nil {
+			idx = *tc.Index
+		}
+		pc := a.calls[idx]
+		if pc == nil {
+			pc = &oaPartial{}
+			a.calls[idx] = pc
+		}
+		if tc.ID != "" {
+			pc.id = tc.ID
+		}
+		if tc.Function.Name != "" {
+			pc.name += tc.Function.Name
+		}
+		if !pc.started && pc.name != "" {
+			pc.started = true
+			a.emit(StreamEvent{Type: EventToolUseStart, Index: idx, Block: &ContentBlock{Type: BlockToolUse, ID: pc.id, Name: pc.name}})
+		}
+		if tc.Function.Arguments != "" {
+			pc.args.WriteString(tc.Function.Arguments)
+			a.emit(StreamEvent{Type: EventToolUseDelta, Index: idx, Text: tc.Function.Arguments})
+		}
+	}
+	if finish != "" {
+		a.finishReason = finish
+	}
+}
+
+func (a *oaAssembler) finish() *Response {
+	out := a.out
+	thinking, text, calls, finish, emit := &a.thinking, &a.text, a.calls, a.finishReason, a.emit
 	if thinking.Len() > 0 {
 		out.Message.Content = append(out.Message.Content, ContentBlock{Type: BlockThinking, Thinking: thinking.String()})
 	}
@@ -297,5 +386,5 @@ func (p *OpenAIProvider) Stream(ctx context.Context, req *Request, onEvent func(
 	}
 	u := out.Usage
 	emit(StreamEvent{Type: EventMessageEnd, Usage: &u})
-	return out, nil
+	return out
 }

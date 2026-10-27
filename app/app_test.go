@@ -66,31 +66,31 @@ func TestNewAssemblesEverything(t *testing.T) {
 	}
 	defer a.Close()
 
-	if len(a.Skills) != 2 || a.Skills[0].Name != "user-skill" || a.Skills[1].Name != "x" {
-		t.Errorf("应发现用户级与项目级技能：%+v", a.Skills)
+	if len(a.Skills()) != 2 || a.Skills()[0].Name != "user-skill" || a.Skills()[1].Name != "x" {
+		t.Errorf("应发现用户级与项目级技能：%+v", a.Skills())
 	}
-	if len(a.Warnings) != 1 || !strings.Contains(a.Warnings[0], "缺少 description") {
-		t.Errorf("无效技能应产生警告：%v", a.Warnings)
+	if len(a.Warnings()) != 1 || !strings.Contains(a.Warnings()[0], "缺少 description") {
+		t.Errorf("无效技能应产生警告：%v", a.Warnings())
 	}
 	subs := map[string]bool{}
-	for _, d := range a.Subagents {
+	for _, d := range a.Subagents() {
 		subs[d.Name] = true
 	}
 	if !subs["y"] || !subs["explore"] || !subs["general-purpose"] {
 		t.Errorf("应合并内置与自定义子 Agent：%v", subs)
 	}
 	want := []string{"bash", "edit_file", "glob", "grep", "list_dir", "memory_delete", "memory_save", "memory_search", "my_tool", "read_file", "skill", "task", "todo_write", "write_file"}
-	if got := a.Agent.Tools.Names(); strings.Join(got, ",") != strings.Join(want, ",") {
+	if got := a.Agent().Tools.Names(); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("工具注册不全：\n得到 %v\n期望 %v", got, want)
 	}
-	if a.Memory == nil || a.Store == nil || a.Traces == nil || a.MCP == nil || a.Agent.Compactor == nil {
+	if a.Memory() == nil || a.Store == nil || a.Traces == nil || a.MCP == nil || a.Agent().Compactor == nil {
 		t.Errorf("组件未初始化：%+v", a)
 	}
-	if a.Agent.Permissions.Mode() != permission.ModeDefault {
+	if a.Agent().Permissions.Mode() != permission.ModeDefault {
 		t.Errorf("权限模式错误")
 	}
 
-	sp := a.Agent.SystemPrompt()
+	sp := a.Agent().SystemPrompt()
 	for _, s := range []string{"**x**: 示例技能", "**y**: 示例子 Agent", "使用中文注释", "额外说明 XYZ", "长期记忆", cfg.WorkDir} {
 		if !strings.Contains(sp, s) {
 			t.Errorf("系统提示词应包含 %q", s)
@@ -102,7 +102,7 @@ func TestNewAssemblesEverything(t *testing.T) {
 	if sess.Model != cfg.Model {
 		t.Errorf("新会话应记录模型")
 	}
-	res, err := a.Agent.Run(context.Background(), sess, "hi", nil)
+	res, err := a.Run(context.Background(), sess, "hi", nil)
 	if err != nil || res.Text != "你好" {
 		t.Fatalf("运行失败：%+v %v", res, err)
 	}
@@ -136,23 +136,23 @@ func TestNewOptionalFeatures(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	if a.Memory != nil || a.Agent.Compactor != nil {
+	if a.Memory() != nil || a.Agent().Compactor != nil {
 		t.Errorf("关闭的功能不应初始化")
 	}
-	if _, ok := a.Agent.Tools.Get("memory_save"); ok {
+	if _, ok := a.Agent().Tools.Get("memory_save"); ok {
 		t.Errorf("关闭记忆时不应注册记忆工具")
 	}
-	if _, ok := a.Agent.Tools.Get("skill"); ok {
+	if _, ok := a.Agent().Tools.Get("skill"); ok {
 		t.Errorf("没有技能时不应注册 skill 工具")
 	}
 	found := false
-	for _, w := range a.Warnings {
+	for _, w := range a.Warnings() {
 		if strings.Contains(w, "MCP 服务器 broken 连接失败") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("MCP 连接失败应记录警告：%v", a.Warnings)
+		t.Errorf("MCP 连接失败应记录警告：%v", a.Warnings())
 	}
 	if files, _ := filepath.Glob(filepath.Join(cfg.ProjectDir, "traces", "*.jsonl")); len(files) != 0 {
 		t.Errorf("关闭 trace 时不应写文件")
@@ -174,7 +174,7 @@ func TestNewErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer a.Close()
-		res, _ := a.Agent.Run(context.Background(), a.NewSession(), "回声", nil)
+		res, _ := a.Run(context.Background(), a.NewSession(), "回声", nil)
 		if res.Text != "你说的是：回声" {
 			t.Errorf("mock provider 应复述输入：%q", res.Text)
 		}

@@ -1,4 +1,4 @@
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo v0.1.0)
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo v0.1.1)
 BIN     := bin/goagent
 PKG     := ./cmd/goagent
 LDFLAGS := -s -w -X main.version=$(VERSION)

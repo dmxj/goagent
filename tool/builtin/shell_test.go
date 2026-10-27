@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dmxj/goagent/procenv"
 )
 
 func TestBash(t *testing.T) {
@@ -68,6 +70,30 @@ func TestBash(t *testing.T) {
 		res := call(t, small, env, map[string]any{"command": "seq 1 1000"})
 		if !strings.Contains(res.Content, "省略") {
 			t.Errorf("超长输出应被截断")
+		}
+	})
+	t.Run("环境变量过滤：密钥不会泄露给命令", func(t *testing.T) {
+		t.Setenv("GOAGENT_API_KEY", "sk-should-not-leak")
+		t.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-leak")
+		t.Setenv("OPENAI_API_KEY", "sk-oa-leak")
+		t.Setenv("MY_SERVICE_PASSWORD", "pw-leak")
+		t.Setenv("GOPROXY", "https://goproxy.cn,direct")
+		t.Setenv("CUSTOM_VISIBLE", "yes")
+		res := call(t, b, env, map[string]any{"command": "env"})
+		for _, leak := range []string{"sk-should-not-leak", "sk-ant-leak", "sk-oa-leak", "pw-leak", "CUSTOM_VISIBLE"} {
+			if strings.Contains(res.Content, leak) {
+				t.Errorf("env 输出泄露了 %s：\n%s", leak, res.Content)
+			}
+		}
+		for _, keep := range []string{"PATH=", "GOPROXY=https://goproxy.cn,direct", "GOAGENT=1"} {
+			if !strings.Contains(res.Content, keep) {
+				t.Errorf("env 输出应保留 %s：\n%s", keep, res.Content)
+			}
+		}
+		custom := Bash(Options{BashTimeout: 5 * time.Second, MaxOutput: 30000, Env: procenv.Policy{Allow: []string{"CUSTOM_VISIBLE"}, Extra: map[string]string{"INJECTED": "v-${CUSTOM_VISIBLE}"}}})
+		res = call(t, custom, env, map[string]any{"command": "echo $CUSTOM_VISIBLE $INJECTED $OPENAI_API_KEY"})
+		if strings.TrimSpace(strings.Split(res.Content, "\n")[0]) != "yes v-yes" {
+			t.Errorf("bash_env.allow / extra 未生效：%q", res.Content)
 		}
 	})
 	t.Run("指定 shell", func(t *testing.T) {

@@ -2,6 +2,7 @@ package trace
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -190,5 +191,118 @@ func TestTree(t *testing.T) {
 	}
 	if Tree(nil) != "" {
 		t.Errorf("空列表应输出空字符串")
+	}
+}
+
+func TestSetTextRedactAndTruncate(t *testing.T) {
+	mem := NewMemory(0)
+	tr := New(mem)
+	tr.SetMaxAttrBytes(64)
+	tr.SetSecrets("my-very-secret-key-123", "short")
+	_, sp := tr.Start(context.Background(), "llm.call", KindLLM, map[string]any{"system": "key=my-very-secret-key-123"})
+	sp.SetText("llm.request.body", `{"auth":"my-very-secret-key-123","x":"`+strings.Repeat("长", 40)+`"}`)
+	sp.SetAttr("note", "token sk-ant-abcdefghijklmnopqrstuvwxyz0123 here")
+	sp.SetJSON("llm.request.params", map[string]any{"model": "m", "max_tokens": 10})
+	if len(tr.Active("")) != 1 {
+		t.Errorf("进行中的 Span 应出现在 Active 中")
+	}
+	sp.Finish()
+	if len(tr.Active("")) != 0 {
+		t.Errorf("结束后应从 Active 中移除")
+	}
+	got := mem.Spans("")[0]
+	body := got.Attrs["llm.request.body"].(string)
+	if strings.Contains(body, "my-very-secret-key-123") || !strings.Contains(body, "[REDACTED]") {
+		t.Errorf("配置的密钥应被抹掉：%s", body)
+	}
+	if !strings.Contains(body, "已截断") || len(body) > 64+80 {
+		t.Errorf("超过上限应截断并带标记：%d %s", len(body), body)
+	}
+	if tr := got.Attrs[AttrTruncated].([]string); len(tr) != 1 || tr[0] != "llm.request.body" {
+		t.Errorf("trace.truncated = %v", tr)
+	}
+	if strings.Contains(got.Attrs["system"].(string), "secret") || strings.Contains(got.Attrs["note"].(string), "sk-ant-") {
+		t.Errorf("Start 属性与 SetAttr 也应脱敏：%v", got.Attrs)
+	}
+	if string(got.Attrs["llm.request.params"].(json.RawMessage)) != `{"max_tokens":10,"model":"m"}` {
+		t.Errorf("SetJSON 应保存结构化 JSON：%s", got.Attrs["llm.request.params"])
+	}
+	b, _ := json.Marshal(got)
+	if !strings.Contains(string(b), `"llm.request.params":{"max_tokens":10`) {
+		t.Errorf("结构化属性在 JSON 中应是对象：%s", b)
+	}
+	light := got.Light(10, 5)
+	if om, _ := light.Attrs[AttrOmitted].([]string); len(om) == 0 {
+		t.Errorf("Light 应列出被省略的大属性")
+	}
+	if _, ok := mem.Span(got.SpanID); !ok {
+		t.Errorf("Memory.Span 应能按 ID 查到")
+	}
+}
+
+func TestOmitZeroEnd(t *testing.T) {
+	_, sp := New().Start(context.Background(), "x", KindAgent, nil)
+	b, _ := json.Marshal(sp.Snapshot())
+	if strings.Contains(string(b), "0001-01-01") || strings.Contains(string(b), `"end"`) {
+		t.Errorf("进行中的 Span 不应输出零值 end：%s", b)
+	}
+}
+
+func TestMemoryByteBudget(t *testing.T) {
+	m := NewMemory(100)
+	m.MaxBytes = 3000
+	for i := 0; i < 10; i++ {
+		m.Export(SpanData{SpanID: string(rune('a' + i)), Start: time.Unix(int64(i), 0), Attrs: map[string]any{"body": strings.Repeat("x", 1000)}})
+	}
+	got := m.Spans("")
+	if len(got) > 3 || got[len(got)-1].SpanID != "j" {
+		t.Errorf("超过字节上限应淘汰最旧的 Span：剩 %d 个", len(got))
+	}
+}
+
+func TestDailyFileRotates(t *testing.T) {
+	dir := t.TempDir()
+	d, err := NewDailyFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	day := time.Date(2026, 10, 27, 23, 59, 0, 0, time.Local)
+	d.Now = func() time.Time { return day }
+	d.Export(SpanData{SpanID: "a"})
+	day = day.Add(2 * time.Minute)
+	d.Export(SpanData{SpanID: "b"})
+	d.SetEnabled(false)
+	d.Export(SpanData{SpanID: "c"})
+	_ = d.Close()
+	a, _ := ReadFile(filepath.Join(dir, "20261027.jsonl"))
+	b, _ := ReadFile(filepath.Join(dir, "20261028.jsonl"))
+	if len(a) != 1 || len(b) != 1 || b[0].SpanID != "b" {
+		t.Errorf("跨天应切换文件：%v %v", a, b)
+	}
+	if d.Path() != filepath.Join(dir, "20261028.jsonl") {
+		t.Errorf("Path = %s", d.Path())
+	}
+}
+
+func TestBuildTree(t *testing.T) {
+	base := time.Unix(1000, 0)
+	spans := []SpanData{
+		{SpanID: "r", Name: "agent.run", Start: base},
+		{SpanID: "t", ParentID: "r", Name: "tool.task", Start: base.Add(2)},
+		{SpanID: "l", ParentID: "r", Name: "llm.call", Start: base.Add(1)},
+		{SpanID: "s", ParentID: "t", Name: "subagent.explore", Start: base.Add(3)},
+		{SpanID: "s", ParentID: "t", Name: "subagent.explore", Start: base.Add(3)},
+		{SpanID: "o", ParentID: "gone", Name: "orphan", Start: base.Add(4)},
+	}
+	roots := BuildTree(spans)
+	if len(roots) != 2 || roots[0].SpanID != "r" || roots[1].SpanID != "o" {
+		t.Fatalf("根节点错误：%+v", roots)
+	}
+	if kids := roots[0].Children; len(kids) != 2 || kids[0].SpanID != "l" || len(kids[1].Children) != 1 {
+		t.Errorf("子节点错误：%+v", kids)
+	}
+	b, _ := json.Marshal(roots[1])
+	if !strings.Contains(string(b), `"span_id":"o"`) || !strings.Contains(string(b), `"children":[]`) {
+		t.Errorf("Node JSON 应平铺 SpanData 字段并带 children：%s", b)
 	}
 }

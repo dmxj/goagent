@@ -203,9 +203,44 @@ func TestCheck(t *testing.T) {
 			t.Errorf("remember 只对同一工具生效，edit_file 仍应询问")
 		}
 	})
+	t.Run("remember 只作用于当前会话", func(t *testing.T) {
+		asks := 0
+		grants := NewGrants()
+		c, _ := NewChecker(Config{}, ApproverFunc(func(context.Context, Request, string) (bool, bool, error) {
+			asks++
+			return true, true, nil
+		}))
+		c.UseGrants(grants)
+		a := write
+		a.SessionID = "sess-A"
+		b := write
+		b.SessionID = "sess-B"
+		if err := c.Check(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+		if d, _ := c.Evaluate(a); d != Allow {
+			t.Errorf("会话 A 记住后应直接允许")
+		}
+		if d, _ := c.Evaluate(b); d != Ask {
+			t.Errorf("会话 A 的'总是允许'不应影响会话 B，得到 %s", d)
+		}
+		// 配置热更新会重建 Checker：共享同一个 Grants 时决定不丢失
+		c2, _ := NewChecker(Config{}, AutoDeny)
+		c2.UseGrants(grants)
+		if d, _ := c2.Evaluate(a); d != Allow {
+			t.Errorf("新 Checker 共享 Grants 后应保留会话 A 的授权")
+		}
+		grants.Clear("sess-A")
+		if d, _ := c2.Evaluate(a); d != Ask {
+			t.Errorf("Clear 后应重新询问")
+		}
+		if got := grants.Rules("sess-A"); len(got) != 0 {
+			t.Errorf("Clear 后 Rules 应为空：%v", got)
+		}
+	})
 	t.Run("ask 规则优先于 remember", func(t *testing.T) {
 		c, _ := NewChecker(Config{Ask: []string{"write_file(secret/**)"}}, AutoApprove)
-		c.session["write_file"] = true
+		c.Grants().Allow("", "write_file")
 		if d, _ := c.Evaluate(req("write_file", map[string]string{"path": "secret/key"}, false)); d != Ask {
 			t.Errorf("ask 规则应优先")
 		}

@@ -60,6 +60,12 @@ func (s *Store) Save(n Note) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	file := slug(n.Name) + ".md"
+	// 不同的名称可能生成同一个文件名（"用户/偏好" 与 "用户 偏好"），直接覆盖会悄悄丢掉另一条记忆
+	if b, err := os.ReadFile(filepath.Join(s.Dir, file)); err == nil {
+		if old := parseNote(string(b)); old.Name != "" && old.Name != n.Name {
+			return "", fmt.Errorf("记忆名称 %q 与已有的 %q 对应同一个文件 %s，请换一个名称，或使用完全相同的名称覆盖", n.Name, old.Name, file)
+		}
+	}
 	body := frontmatter.Render(map[string]string{
 		"name": n.Name, "description": n.Description, "type": n.Type,
 		"updated": time.Now().Format(time.RFC3339),
@@ -70,13 +76,17 @@ func (s *Store) Save(n Note) (string, error) {
 	return file, s.rebuildIndexLocked()
 }
 
-// Get 按名称读取记忆。
+// Get 按名称读取记忆（名称必须与保存时一致，避免因文件名相同取到另一条记忆）。
 func (s *Store) Get(name string) (*Note, error) {
 	b, err := os.ReadFile(filepath.Join(s.Dir, slug(name)+".md"))
 	if err != nil {
 		return nil, fmt.Errorf("记忆 %q 不存在", name)
 	}
-	return parseNote(string(b)), nil
+	n := parseNote(string(b))
+	if n.Name != "" && n.Name != name {
+		return nil, fmt.Errorf("记忆 %q 不存在（同名文件属于 %q）", name, n.Name)
+	}
+	return n, nil
 }
 
 // Delete 删除记忆。
@@ -153,13 +163,39 @@ func (s *Store) rebuildIndexLocked() error {
 	return os.WriteFile(filepath.Join(s.Dir, "MEMORY.md"), []byte(sb.String()), 0o644)
 }
 
-// Index 返回 MEMORY.md 索引内容（注入系统提示词）。
+// 索引注入系统提示词的上限：记忆很多时只列出最近更新的，其余提示用 memory_search 检索。
+const (
+	MaxIndexLines = 200
+	MaxIndexBytes = 25 * 1024
+)
+
+// Index 返回 MEMORY.md 索引内容（注入系统提示词），超过 MaxIndexLines 行或 MaxIndexBytes 字节时截断。
+// 索引按更新时间倒序排列，截断时保留的是最近更新的记忆。
 func (s *Store) Index() string {
 	b, err := os.ReadFile(filepath.Join(s.Dir, "MEMORY.md"))
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(b))
+	text := strings.TrimSpace(string(b))
+	lines := strings.Split(text, "\n")
+	size, keep := 0, 0
+	for i, l := range lines {
+		if i >= MaxIndexLines || size+len(l)+1 > MaxIndexBytes {
+			break
+		}
+		size += len(l) + 1
+		keep = i + 1
+	}
+	if keep == len(lines) {
+		return text
+	}
+	rest := 0
+	for _, l := range lines[keep:] {
+		if strings.HasPrefix(l, "- ") {
+			rest++
+		}
+	}
+	return strings.Join(lines[:keep], "\n") + fmt.Sprintf("\n\n（还有 %d 条较早的记忆未列出，可用 memory_search 检索）", rest)
 }
 
 // ---------- 记忆工具 ----------

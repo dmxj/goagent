@@ -441,3 +441,36 @@ func TestGrep(t *testing.T) {
 		t.Errorf("clip 应在字符边界截断")
 	}
 }
+
+func TestSymlinkEscape(t *testing.T) {
+	outside := t.TempDir()
+	writeFile(t, outside, "secret.txt", "top secret")
+	env := testEnv(t)
+	writeFile(t, env.WorkDir, "inside/ok.txt", "fine")
+	if err := os.Symlink(outside, filepath.Join(env.WorkDir, "link")); err != nil {
+		t.Skip("当前系统不支持符号链接：", err)
+	}
+	if err := os.Symlink(filepath.Join(env.WorkDir, "inside"), filepath.Join(env.WorkDir, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultOptions()
+	for _, tt := range []struct {
+		tool  tool.Tool
+		input map[string]any
+	}{
+		{ReadFile(opts), map[string]any{"path": "link/secret.txt"}},
+		{WriteFile(opts), map[string]any{"path": "link/new.txt", "content": "x"}},
+		{ListDir(opts), map[string]any{"path": "link"}},
+	} {
+		res := call(t, tt.tool, env, tt.input)
+		if !res.IsError || !strings.Contains(res.Content, "符号链接") {
+			t.Errorf("%s 不应通过符号链接逃出工作目录：%s", tt.tool.Info().Name, res.Content)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(outside, "new.txt")); err == nil {
+		t.Errorf("不应在工作目录外创建文件")
+	}
+	if res := call(t, ReadFile(opts), env, map[string]any{"path": "alias/ok.txt"}); res.IsError {
+		t.Errorf("指向工作目录内部的符号链接应允许：%s", res.Content)
+	}
+}

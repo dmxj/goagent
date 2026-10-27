@@ -11,7 +11,7 @@ ARG GOPROXY=https://goproxy.cn,direct
 ENV GOPROXY=${GOPROXY} CGO_ENABLED=0
 # RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
 
-ARG VERSION=v0.1.0
+ARG VERSION=v0.1.1
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download

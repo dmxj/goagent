@@ -68,3 +68,28 @@ func TestBuild(t *testing.T) {
 		t.Errorf("自定义身份或无工具时输出错误：%s", out)
 	}
 }
+
+func TestSectionsAndExtra(t *testing.T) {
+	b := &Builder{
+		Identity:      "身份",
+		WorkDir:       "/w",
+		Instructions:  []memory.Instruction{{Path: "/w/AGENTS.md", Content: "指令"}},
+		Sections:      map[string]bool{SectionEnvironment: false, SectionInstructions: false, SectionTools: true},
+		ExtraSections: []Section{{Title: "团队约定", Content: "提交前跑测试"}, {Title: "空章节", Content: "  "}, {Content: "无标题内容"}},
+		Extra:         "末尾",
+	}
+	out := b.Build(&agent.Agent{Model: "m", Tools: tool.NewRegistry(dummy("read_file"))})
+	for _, want := range []string{"身份", "# 工具", "# 团队约定\n提交前跑测试", "无标题内容", "末尾"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("应包含 %q：\n%s", want, out)
+		}
+	}
+	for _, not := range []string{"# 环境", "# 项目指令", "空章节"} {
+		if strings.Contains(out, not) {
+			t.Errorf("不应包含 %q：\n%s", not, out)
+		}
+	}
+	if strings.Index(out, "团队约定") > strings.Index(out, "末尾") {
+		t.Errorf("自定义章节应在 Extra 之前")
+	}
+}

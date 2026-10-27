@@ -125,3 +125,28 @@ func TestRepoSkills(t *testing.T) {
 		t.Errorf("缺少示例技能：%v", names)
 	}
 }
+
+// TestDiscoverFollowsSymlinkedDir：skills/ 下指向目录的符号链接也是技能目录。
+func TestDiscoverFollowsSymlinkedDir(t *testing.T) {
+	root := t.TempDir()
+	shared := filepath.Join(root, "shared")
+	writeSkill(t, shared, "linked", "---\ndescription: 来自共享仓库\n---\n正文")
+	skills := filepath.Join(root, "skills")
+	if err := os.MkdirAll(skills, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(shared, "linked"), filepath.Join(skills, "linked")); err != nil {
+		t.Skip("当前系统不支持符号链接：", err)
+	}
+	// 指向文件的符号链接与悬空链接都应被忽略
+	_ = os.WriteFile(filepath.Join(root, "file.txt"), []byte("x"), 0o644)
+	_ = os.Symlink(filepath.Join(root, "file.txt"), filepath.Join(skills, "file-link"))
+	_ = os.Symlink(filepath.Join(root, "missing"), filepath.Join(skills, "dangling"))
+	got, errs := Discover(Dir{Path: skills, Source: "project"})
+	if len(errs) != 0 || len(got) != 1 || got[0].Name != "linked" {
+		t.Fatalf("应发现符号链接指向的技能目录：%+v %v", got, errs)
+	}
+	if body, err := got[0].Body(); err != nil || body != "正文" {
+		t.Errorf("应能读取链接目录中的正文：%q %v", body, err)
+	}
+}

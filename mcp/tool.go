@@ -61,58 +61,149 @@ func ToolName(server, name string) string {
 }
 
 // Manager 管理多个 MCP 服务器连接。
+//
+// 配置热更新时调用 Sync：配置没变的服务器复用现有连接，新增 / 修改的重新连接，
+// 删除 / 被替换的旧连接返回给调用方，由它在正在运行的对话结束后关闭。
 type Manager struct {
-	mu      sync.Mutex
-	clients map[string]*Client
-	tools   []tool.Tool
-	Errors  map[string]error
+	mu         sync.Mutex
+	entries    map[string]*entry
+	failedKeys map[string]string // 连接失败时的配置，配置不变时热更新不会反复重试
+	Errors     map[string]error
+}
+
+type entry struct {
+	key    string // 配置的 JSON，用于判断是否变化
+	client *Client
+	tools  []tool.Tool
 }
 
 // NewManager 创建管理器。
 func NewManager() *Manager {
-	return &Manager{clients: map[string]*Client{}, Errors: map[string]error{}}
+	return &Manager{entries: map[string]*entry{}, Errors: map[string]error{}}
+}
+
+func configKey(cfg ServerConfig) string {
+	b, _ := json.Marshal(cfg)
+	return string(b)
 }
 
 // ConnectAll 并发连接所有服务器；单个失败不影响其它（记录在 Errors 中）。
 func (m *Manager) ConnectAll(ctx context.Context, servers map[string]ServerConfig) {
-	var wg sync.WaitGroup
-	names := make([]string, 0, len(servers))
-	for name := range servers {
+	m.Sync(ctx, servers, false)
+}
+
+// Sync 让连接与配置保持一致，返回不再使用的旧连接（调用方负责关闭）。
+// retryFailed 为 true 时，配置没变但上次连接失败的服务器也会重新连接。
+func (m *Manager) Sync(ctx context.Context, servers map[string]ServerConfig, retryFailed bool) []*Client {
+	m.mu.Lock()
+	var retired []*Client
+	todo := map[string]ServerConfig{}
+	for name, e := range m.entries {
+		cfg, ok := servers[name]
+		if !ok || configKey(cfg) != e.key {
+			retired = append(retired, e.client)
+			delete(m.entries, name)
+		}
+	}
+	for name, cfg := range servers {
+		if _, ok := m.entries[name]; ok {
+			continue
+		}
+		if _, failed := m.Errors[name]; failed && !retryFailed && m.failedKeys[name] == configKey(cfg) {
+			continue
+		}
+		todo[name] = cfg
+	}
+	for name := range m.Errors {
+		if _, ok := servers[name]; !ok {
+			delete(m.Errors, name)
+			delete(m.failedKeys, name)
+		}
+	}
+	m.mu.Unlock()
+
+	names := make([]string, 0, len(todo))
+	for name := range todo {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	var wg sync.WaitGroup
 	for _, name := range names {
 		wg.Add(1)
 		go func(name string, cfg ServerConfig) {
 			defer wg.Done()
 			c, err := Connect(ctx, name, cfg)
+			var tools []tool.Tool
 			if err == nil {
 				var infos []ToolInfo
-				infos, err = c.ListTools(ctx)
-				if err == nil {
-					m.mu.Lock()
-					m.clients[name] = c
+				if infos, err = c.ListTools(ctx); err == nil {
 					for _, ti := range infos {
-						m.tools = append(m.tools, &mcpTool{client: c, info: ti, name: ToolName(name, ti.Name)})
+						tools = append(tools, &mcpTool{client: c, info: ti, name: ToolName(name, ti.Name)})
 					}
-					m.mu.Unlock()
-					return
+				} else {
+					c.Close()
 				}
-				c.Close()
 			}
 			m.mu.Lock()
-			m.Errors[name] = err
-			m.mu.Unlock()
+			defer m.mu.Unlock()
+			if err != nil {
+				m.Errors[name] = err
+				if m.failedKeys == nil {
+					m.failedKeys = map[string]string{}
+				}
+				m.failedKeys[name] = configKey(cfg)
+				return
+			}
+			delete(m.Errors, name)
+			delete(m.failedKeys, name)
+			m.entries[name] = &entry{key: configKey(cfg), client: c, tools: tools}
 		}(name, servers[name])
 	}
 	wg.Wait()
+	return retired
 }
 
-// Tools 返回所有 MCP 工具。
+// Tools 返回所有 MCP 工具（按服务器名排序）。
 func (m *Manager) Tools() []tool.Tool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return append([]tool.Tool(nil), m.tools...)
+	var out []tool.Tool
+	for _, name := range m.namesLocked() {
+		out = append(out, m.entries[name].tools...)
+	}
+	return out
+}
+
+func (m *Manager) namesLocked() []string {
+	names := make([]string, 0, len(m.entries))
+	for name := range m.entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// Clients 返回当前全部连接。
+func (m *Manager) Clients() []*Client {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*Client
+	for _, name := range m.namesLocked() {
+		out = append(out, m.entries[name].client)
+	}
+	return out
+}
+
+// Owns 报告连接是否仍由管理器持有（热更新后被换下的旧连接返回 false）。
+func (m *Manager) Owns(c *Client) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.entries {
+		if e.client == c {
+			return true
+		}
+	}
+	return false
 }
 
 // Servers 返回已连接服务器名与其工具数。
@@ -120,13 +211,19 @@ func (m *Manager) Servers() map[string]int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := map[string]int{}
-	for _, t := range m.tools {
-		out[t.(*mcpTool).client.Name]++
+	for name, e := range m.entries {
+		out[name] = len(e.tools)
 	}
-	for name := range m.clients {
-		if _, ok := out[name]; !ok {
-			out[name] = 0
-		}
+	return out
+}
+
+// ErrorsSnapshot 返回连接错误的副本（并发安全）。
+func (m *Manager) ErrorsSnapshot() map[string]error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]error, len(m.Errors))
+	for k, v := range m.Errors {
+		out[k] = v
 	}
 	return out
 }
@@ -136,9 +233,9 @@ func (m *Manager) Instructions() map[string]string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := map[string]string{}
-	for name, c := range m.clients {
-		if c.Instructions != "" {
-			out[name] = c.Instructions
+	for name, e := range m.entries {
+		if e.client.Instructions != "" {
+			out[name] = e.client.Instructions
 		}
 	}
 	return out
@@ -148,8 +245,9 @@ func (m *Manager) Instructions() map[string]string {
 func (m *Manager) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, c := range m.clients {
-		c.Close()
+	for name, e := range m.entries {
+		e.client.Close()
+		delete(m.entries, name)
 	}
 }
 

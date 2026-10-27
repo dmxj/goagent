@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -66,7 +65,8 @@ func Bash(opts Options) tool.Tool {
 			if c.Env != nil && c.Env.WorkDir != "" {
 				cmd.Dir = c.Env.WorkDir
 			}
-			cmd.Env = append(os.Environ(), "GOAGENT=1", "TERM=dumb", "NO_COLOR=1")
+			// 只传递白名单内的环境变量：模型执行 env 也看不到 API Key 等密钥
+			cmd.Env = opts.Env.Environ("GOAGENT=1", "TERM=dumb", "NO_COLOR=1")
 			cmd.WaitDelay = 3 * time.Second
 			var out syncBuf
 			cmd.Stdout, cmd.Stderr = &out, &out
@@ -132,7 +132,11 @@ func HTMLToText(html string) string {
 
 // WebFetch 抓取网页并转为纯文本。
 func WebFetch(opts Options) tool.Tool {
-	client := &http.Client{Timeout: 30 * time.Second}
+	timeout := opts.FetchTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	client := &http.Client{Timeout: timeout}
 	return tool.Func("web_fetch", "抓取一个网页（http/https），返回去掉 HTML 标签后的正文文本，最多约 30KB。", true,
 		func(ctx context.Context, in fetchArgs, c *tool.Call) (*tool.Result, error) {
 			if !strings.HasPrefix(in.URL, "http://") && !strings.HasPrefix(in.URL, "https://") {

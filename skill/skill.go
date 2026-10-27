@@ -48,7 +48,20 @@ type Dir struct {
 	Source string
 }
 
+// isDir 判断目录项是否为目录；指向目录的符号链接也算（常见做法是把共享的技能仓库链接进 skills/）。
+func isDir(parent string, e os.DirEntry) bool {
+	if e.IsDir() {
+		return true
+	}
+	if e.Type()&os.ModeSymlink == 0 {
+		return false
+	}
+	fi, err := os.Stat(filepath.Join(parent, e.Name()))
+	return err == nil && fi.IsDir()
+}
+
 // Discover 扫描目录，返回技能列表。后出现的目录中同名技能会覆盖之前的（项目级覆盖用户级）。
+// 指向目录的符号链接会被跟随。
 func Discover(dirs ...Dir) ([]Skill, []error) {
 	byName := map[string]Skill{}
 	var errs []error
@@ -58,7 +71,7 @@ func Discover(dirs ...Dir) ([]Skill, []error) {
 			continue
 		}
 		for _, e := range entries {
-			if !e.IsDir() {
+			if !isDir(d.Path, e) {
 				continue
 			}
 			p := filepath.Join(d.Path, e.Name(), "SKILL.md")

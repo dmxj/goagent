@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -42,6 +43,8 @@ type anthropicReq struct {
 	Tools         []ToolSpec      `json:"tools,omitempty"`
 	MaxTokens     int             `json:"max_tokens"`
 	Temperature   *float64        `json:"temperature,omitempty"`
+	TopP          *float64        `json:"top_p,omitempty"`
+	TopK          int             `json:"top_k,omitempty"`
 	StopSequences []string        `json:"stop_sequences,omitempty"`
 	Stream        bool            `json:"stream"`
 	Thinking      *anthropicThink `json:"thinking,omitempty"`
@@ -108,7 +111,24 @@ func sanitizeMessages(msgs []Message) []Message {
 	return out
 }
 
-func (p *AnthropicProvider) Stream(ctx context.Context, req *Request, onEvent func(StreamEvent)) (*Response, error) {
+// marshalBody 序列化请求体，并把 extra 合并到顶层（同名字段以 extra 为准）。
+func marshalBody(body any, extra map[string]any) ([]byte, error) {
+	buf, err := json.Marshal(body)
+	if err != nil || len(extra) == 0 {
+		return buf, err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(buf, &m); err != nil {
+		return nil, err
+	}
+	for k, v := range extra {
+		m[k] = v
+	}
+	return json.Marshal(m)
+}
+
+// BuildRequestBody 返回发给 Anthropic 的原生请求体（便于测试与调试）。
+func (p *AnthropicProvider) BuildRequestBody(req *Request) ([]byte, error) {
 	body := anthropicReq{
 		Model:         req.Model,
 		System:        req.System,
@@ -116,8 +136,10 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req *Request, onEvent fu
 		Tools:         req.Tools,
 		MaxTokens:     req.MaxTokens,
 		Temperature:   req.Temperature,
+		TopP:          req.TopP,
+		TopK:          req.TopK,
 		StopSequences: req.StopSequences,
-		Stream:        true,
+		Stream:        !req.NoStream,
 	}
 	if body.MaxTokens == 0 {
 		body.MaxTokens = 8192
@@ -125,7 +147,11 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req *Request, onEvent fu
 	if req.ThinkingBudget > 0 {
 		body.Thinking = &anthropicThink{Type: "enabled", BudgetTokens: req.ThinkingBudget}
 	}
-	buf, err := json.Marshal(body)
+	return marshalBody(body, req.ExtraBody)
+}
+
+func (p *AnthropicProvider) Stream(ctx context.Context, req *Request, onEvent func(StreamEvent)) (resp *Response, err error) {
+	buf, err := p.BuildRequestBody(req)
 	if err != nil {
 		return nil, err
 	}
@@ -134,33 +160,92 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req *Request, onEvent fu
 		return nil, err
 	}
 	hreq.Header.Set("content-type", "application/json")
-	hreq.Header.Set("accept", "text/event-stream")
+	if req.NoStream {
+		hreq.Header.Set("accept", "application/json")
+	} else {
+		hreq.Header.Set("accept", "text/event-stream")
+	}
 	hreq.Header.Set("x-api-key", p.APIKey)
 	hreq.Header.Set("authorization", "Bearer "+p.APIKey)
 	hreq.Header.Set("anthropic-version", p.Version)
 	for k, v := range p.Headers {
 		hreq.Header.Set(k, v)
 	}
-	resp, err := p.Client.Do(hreq)
+	for k, v := range req.Headers {
+		hreq.Header.Set(k, v)
+	}
+	rec := startExchange(ctx, p.Name(), hreq, buf, !req.NoStream)
+	defer func() { rec.done(err) }()
+	hresp, err := p.Client.Do(hreq)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return nil, newAPIError(p.Name(), resp)
+	defer hresp.Body.Close()
+	rec.response(hresp)
+	if hresp.StatusCode/100 != 2 {
+		return nil, newAPIError(p.Name(), hresp)
 	}
-
 	emit := func(ev StreamEvent) {
 		if onEvent != nil {
 			onEvent(ev)
 		}
 	}
+	if req.NoStream {
+		return p.decodeMessage(rec.tee(hresp.Body, false), emit)
+	}
+	return p.readStream(rec.tee(hresp.Body, true), emit)
+}
+
+// anthropicMessage 是非流式接口返回的完整消息。
+type anthropicMessage struct {
+	Model      string         `json:"model"`
+	Content    []ContentBlock `json:"content"`
+	StopReason string         `json:"stop_reason"`
+	Usage      anthropicUsage `json:"usage"`
+}
+
+// decodeMessage 解析非流式响应，并补发与流式一致的事件（UI 不需要区分两种模式）。
+func (p *AnthropicProvider) decodeMessage(r io.Reader, emit func(StreamEvent)) (*Response, error) {
+	var m anthropicMessage
+	if err := json.NewDecoder(r).Decode(&m); err != nil {
+		return nil, fmt.Errorf("解析响应失败: %w", err)
+	}
+	out := &Response{Message: Message{Role: RoleAssistant}, Model: m.Model, StopReason: m.StopReason, Usage: m.Usage.toUsage()}
+	for i, b := range m.Content {
+		switch b.Type {
+		case BlockText:
+			emit(StreamEvent{Type: EventTextDelta, Index: i, Text: b.Text})
+		case BlockThinking:
+			emit(StreamEvent{Type: EventThinkingDelta, Index: i, Text: b.Thinking})
+		case BlockToolUse:
+			if len(b.Input) == 0 {
+				b.Input = json.RawMessage("{}")
+			}
+			emit(StreamEvent{Type: EventToolUseStart, Index: i, Block: &ContentBlock{Type: BlockToolUse, ID: b.ID, Name: b.Name}})
+			emit(StreamEvent{Type: EventToolUseDelta, Index: i, Text: string(b.Input)})
+			cp := b
+			emit(StreamEvent{Type: EventToolUseEnd, Index: i, Block: &cp})
+		default:
+			continue // redacted_thinking 等暂不支持的块
+		}
+		out.Message.Content = append(out.Message.Content, b)
+	}
+	if out.StopReason == "" {
+		out.StopReason = StopEndTurn
+	}
+	u := out.Usage
+	emit(StreamEvent{Type: EventMessageEnd, Usage: &u})
+	return out, nil
+}
+
+// readStream 解析 SSE 流并组装完整消息。
+func (p *AnthropicProvider) readStream(r io.Reader, emit func(StreamEvent)) (*Response, error) {
 	out := &Response{Message: Message{Role: RoleAssistant}}
 	var blocks []*ContentBlock
 	var jsonBufs []*strings.Builder
 	var streamErr error
 
-	err = ReadSSE(resp.Body, func(e SSEEvent) error {
+	err := ReadSSE(r, func(e SSEEvent) error {
 		if e.Data == "" || e.Data == "[DONE]" {
 			return nil
 		}

@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/dmxj/goagent/internal/procutil"
+	"github.com/dmxj/goagent/procenv"
 )
 
 // Event 是钩子事件名。
@@ -69,6 +69,8 @@ type Config struct {
 	Matcher string `json:"matcher,omitempty"`
 	Command string `json:"command"`
 	Timeout int    `json:"timeout,omitempty"` // 秒，默认 60
+	// Env 是命令的环境变量策略（加载配置时由 tools.bash_env 填入，不来自钩子配置本身）。
+	Env procenv.Policy `json:"-"`
 }
 
 type entry struct {
@@ -81,6 +83,8 @@ type entry struct {
 type Manager struct {
 	mu      sync.RWMutex
 	entries map[Event][]entry
+	// Env 是 LoadConfig 注册的命令钩子使用的环境变量策略（默认剔除密钥）。
+	Env procenv.Policy
 }
 
 // NewManager 创建钩子管理器。
@@ -109,6 +113,7 @@ func (m *Manager) LoadConfig(cfg map[string][]Config, workDir string) error {
 			if strings.TrimSpace(c.Command) == "" {
 				continue
 			}
+			c.Env = m.Env
 			if err := m.On(Event(ev), c.Matcher, CommandHandler(c, workDir)); err != nil {
 				return err
 			}
@@ -190,7 +195,8 @@ func CommandHandler(c Config, workDir string) Handler {
 		payload, _ := json.Marshal(in)
 		cmd := procutil.Command(ctx, shellFor(), c.Command)
 		cmd.Dir = workDir
-		cmd.Env = append(os.Environ(), "GOAGENT_HOOK_EVENT="+string(in.Event), "GOAGENT_TOOL_NAME="+in.ToolName)
+		// 钩子的 stdin 里有模型生成的工具参数，同样只给它白名单内的环境变量
+		cmd.Env = c.Env.Environ("GOAGENT_HOOK_EVENT="+string(in.Event), "GOAGENT_TOOL_NAME="+in.ToolName, "GOAGENT_SESSION_ID="+in.SessionID)
 		cmd.WaitDelay = 3 * time.Second
 		cmd.Stdin = bytes.NewReader(payload)
 		var stdout, stderr bytes.Buffer

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -354,5 +355,55 @@ func TestRenderAndClip(t *testing.T) {
 	}
 	if out := clip(strings.Repeat("中", 10), 4); out != "中…(截断)" {
 		t.Errorf("clip 应在字符边界截断：%q", out)
+	}
+}
+
+func TestSlugCollision(t *testing.T) {
+	s, _ := NewStore(t.TempDir())
+	if _, err := s.Save(Note{Name: "用户/偏好", Content: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Save(Note{Name: "用户 偏好", Content: "B"}); err == nil || !strings.Contains(err.Error(), "同一个文件") {
+		t.Fatalf("文件名冲突时应报错而不是覆盖：%v", err)
+	}
+	if _, err := s.Save(Note{Name: "用户/偏好", Content: "A2"}); err != nil {
+		t.Errorf("同名覆盖应允许：%v", err)
+	}
+	if n, err := s.Get("用户/偏好"); err != nil || n.Content != "A2" {
+		t.Errorf("Get 原名称失败：%v %+v", err, n)
+	}
+	if _, err := s.Get("用户 偏好"); err == nil {
+		t.Errorf("Get 不应因文件名相同取到另一条记忆")
+	}
+}
+
+func TestIndexLimit(t *testing.T) {
+	s, _ := NewStore(t.TempDir())
+	for i := 0; i < MaxIndexLines+20; i++ {
+		if _, err := s.Save(Note{Name: fmt.Sprintf("note-%03d", i), Description: "d", Content: "c"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	idx := s.Index()
+	if n := strings.Count(idx, "\n- "); n >= MaxIndexLines || !strings.Contains(idx, "memory_search") {
+		t.Errorf("索引应截断并提示：%d 行", n)
+	}
+	if len(idx) > MaxIndexBytes+200 {
+		t.Errorf("索引超过字节上限：%d", len(idx))
+	}
+}
+
+func TestEmptyAgentsDoesNotShadowClaude(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.Mkdir(filepath.Join(dir, ".git"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("  \n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("用中文"), 0o644)
+	got := LoadInstructions(dir, "")
+	if len(got) != 1 || !strings.HasSuffix(got[0].Path, "CLAUDE.md") {
+		t.Errorf("空白的 AGENTS.md 不应遮住 CLAUDE.md：%+v", got)
+	}
+	paths := InstructionPaths(dir, "/u")
+	if len(paths) != 1+len(InstructionFiles) || paths[0] != filepath.Join("/u", "AGENTS.md") {
+		t.Errorf("InstructionPaths = %v", paths)
 	}
 }

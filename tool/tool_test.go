@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -257,5 +258,44 @@ func TestNilRegistry(t *testing.T) {
 	var r *Registry
 	if _, ok := r.Get("x"); ok || len(r.List()) != 0 || len(r.Names()) != 0 || len(r.Specs()) != 0 || len(r.Filter(nil).Names()) != 0 {
 		t.Errorf("nil 注册表应视为空")
+	}
+}
+
+type roArgs struct {
+	Mode string `json:"mode"`
+}
+
+type inputAware struct{ Tool }
+
+func (inputAware) ReadOnlyFor(in json.RawMessage) bool { return strings.Contains(string(in), "read") }
+
+func TestConfigureAndReadOnlyFor(t *testing.T) {
+	slow := Func("slow", "原描述", false, func(ctx context.Context, in roArgs, c *Call) (*Result, error) {
+		select {
+		case <-ctx.Done():
+			return Text("超时了：" + strings.Repeat("x", 100)), nil
+		case <-time.After(5 * time.Second):
+			return Text("太慢"), nil
+		}
+	})
+	if Configure(slow, Options{}) != Tool(slow) {
+		t.Errorf("没有覆盖时应原样返回")
+	}
+	yes := true
+	c := Configure(inputAware{slow}, Options{Description: "新描述", TimeoutSec: 1, MaxOutput: 40, Concurrent: &yes})
+	info := c.Info()
+	if info.Description != "新描述" || !info.Concurrent || info.Name != "slow" {
+		t.Errorf("Info 覆盖错误：%+v", info)
+	}
+	start := time.Now()
+	r, err := c.Run(context.Background(), &Call{Input: json.RawMessage(`{}`)})
+	if err != nil || time.Since(start) > 3*time.Second || len(r.Content) > 120 || !strings.Contains(r.Content, "省略") {
+		t.Errorf("超时与输出上限应生效：%v %q", err, r.Content)
+	}
+	if !IsReadOnly(c, json.RawMessage(`{"mode":"read"}`)) || IsReadOnly(c, json.RawMessage(`{"mode":"write"}`)) || IsReadOnly(slow, nil) {
+		t.Errorf("IsReadOnly 应透传 ReadOnlyFor")
+	}
+	if c.(interface{ Unwrap() Tool }).Unwrap().Info().Description != "原描述" {
+		t.Errorf("Unwrap 应返回原工具")
 	}
 }

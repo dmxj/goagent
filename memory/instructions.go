@@ -25,16 +25,17 @@ type Instruction struct {
 func LoadInstructions(workDir, userDir string) []Instruction {
 	var found []Instruction
 	seen := map[string]bool{}
-	add := func(p string) {
+	add := func(p string) bool {
 		if seen[p] {
-			return
+			return true
 		}
 		b, err := os.ReadFile(p)
 		if err != nil || len(strings.TrimSpace(string(b))) == 0 {
-			return
+			return false
 		}
 		seen[p] = true
 		found = append(found, Instruction{Path: p, Content: string(b)})
+		return true
 	}
 	if userDir != "" {
 		add(filepath.Join(userDir, "AGENTS.md"))
@@ -55,12 +56,35 @@ func LoadInstructions(workDir, userDir string) []Instruction {
 	// 从最外层到最内层，保证内层覆盖外层
 	for i := len(chain) - 1; i >= 0; i-- {
 		for _, name := range InstructionFiles {
-			p := filepath.Join(chain[i], name)
-			if _, err := os.Stat(p); err == nil {
-				add(p)
-				break // 同一目录只取优先级最高的一个
+			// 同一目录只取优先级最高的一个"非空"文件：空白的 AGENTS.md 不应遮住同目录的 CLAUDE.md
+			if add(filepath.Join(chain[i], name)) {
+				break
 			}
 		}
 	}
 	return found
+}
+
+// InstructionPaths 返回 LoadInstructions 会检查的全部候选路径（包括尚不存在的），
+// 供配置热更新监视：新建或修改其中任意一个文件都会触发重新加载。
+func InstructionPaths(workDir, userDir string) []string {
+	var out []string
+	if userDir != "" {
+		out = append(out, filepath.Join(userDir, "AGENTS.md"))
+	}
+	dir, _ := filepath.Abs(workDir)
+	for {
+		for _, name := range InstructionFiles {
+			out = append(out, filepath.Join(dir, name))
+		}
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return out
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 // MockProvider 是用于测试与离线演示的假模型。
@@ -41,11 +42,22 @@ func (m *MockProvider) Stream(ctx context.Context, req *Request, onEvent func(St
 	m.calls++
 	m.mu.Unlock()
 
+	// 有记录器时像真实 Provider 一样产生一条"原始往返"记录，便于测试 Trace
+	var rec *Exchange
+	if r := RecorderFrom(ctx); r != nil && r.OnExchange != nil {
+		body, _ := json.Marshal(req)
+		rec = &Exchange{Provider: "mock", Method: "POST", URL: "mock://messages", RequestHeaders: map[string]string{"content-type": "application/json"},
+			RequestBody: string(body), Stream: !req.NoStream, Start: time.Now()}
+		defer func() { r.OnExchange(rec) }()
+	}
 	var msg Message
 	switch {
 	case m.Handler != nil:
 		var err error
 		if msg, err = m.Handler(req); err != nil {
+			if rec != nil {
+				rec.Status, rec.Error = 500, err.Error()
+			}
 			return nil, err
 		}
 	case idx < len(m.Responses):
@@ -91,7 +103,13 @@ func (m *MockProvider) Stream(ctx context.Context, req *Request, onEvent func(St
 	}
 	usage := Usage{InputTokens: in/4 + len(req.System)/4, OutputTokens: len(msg.Text())/4 + 1}
 	emit(StreamEvent{Type: EventMessageEnd, Usage: &usage})
-	return &Response{Message: msg, StopReason: stop, Usage: usage, Model: "mock"}, nil
+	resp := &Response{Message: msg, StopReason: stop, Usage: usage, Model: "mock"}
+	if rec != nil {
+		b, _ := json.Marshal(resp)
+		rec.Status, rec.ResponseBody, rec.ResponseBytes = 200, string(b), int64(len(b))
+		rec.LatencyMS = time.Since(rec.Start).Milliseconds()
+	}
+	return resp, nil
 }
 
 // ToolCall 构造一个工具调用内容块（测试辅助）。

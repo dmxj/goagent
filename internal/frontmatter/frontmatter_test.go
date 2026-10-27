@@ -64,3 +64,24 @@ func TestRenderRoundTrip(t *testing.T) {
 		t.Errorf("往返解析错误：%v %q", got, body)
 	}
 }
+
+func TestParseExtended(t *testing.T) {
+	tests := []struct {
+		name     string
+		text     string
+		wantMeta map[string]string
+	}{
+		{"折叠块 >", "---\nname: x\ndescription: >\n  第一行\n  第二行\nmodel: m\n---\nb", map[string]string{"name": "x", "description": "第一行 第二行", "model": "m"}},
+		{"字面块 |", "---\ndescription: |\n  a\n  b\n---\n", map[string]string{"description": "a\nb"}},
+		{"嵌套映射不覆盖顶层", "---\nname: real\nmetadata:\n  name: nested\n  version: 2\n---\n", map[string]string{"name": "real", "metadata": "", "metadata.name": "nested", "metadata.version": "2"}},
+		{"BOM 与前导空行", "\ufeff\n\n---\nname: bom\n---\n", map[string]string{"name": "bom"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta, _ := Parse(tt.text)
+			if !reflect.DeepEqual(meta, tt.wantMeta) {
+				t.Errorf("meta = %q，期望 %q", meta, tt.wantMeta)
+			}
+		})
+	}
+}

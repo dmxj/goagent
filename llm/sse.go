@@ -80,9 +80,13 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("%s API 错误 (HTTP %d): %s", e.Provider, e.StatusCode, body)
 }
 
-// Retryable 判断错误是否值得重试：限流、服务端错误、网络抖动。
+// Retryable 判断错误本身是否值得重试：限流、服务端错误、网络抖动（含单次连接超时）。
+//
+// 注意：从 Go 1.23 起，拨号 / 读写超时等网络超时错误同样满足
+// errors.Is(err, context.DeadlineExceeded)，仅凭错误无法区分"调用方的 ctx 到期了"
+// 与"这一次连接超时了"。RetryProvider 使用 RetryableContext，结合 ctx.Err() 做判断。
 func Retryable(err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if err == nil || errors.Is(err, context.Canceled) {
 		return false
 	}
 	var ae *APIError
@@ -91,9 +95,41 @@ func Retryable(err error) bool {
 	}
 	var ne net.Error
 	if errors.As(err, &ne) {
+		return true // 拨号失败、连接超时、TLS 握手超时……
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		// 没有 ctx 信息时，把单纯的 DeadlineExceeded 视为单次请求超时（可重试）；
+		// 调用方 ctx 到期的情况由 RetryableContext 排除。
 		return true
 	}
 	return errors.Is(err, io.ErrUnexpectedEOF) || strings.Contains(err.Error(), "connection reset")
+}
+
+// RetryableContext 在 Retryable 的基础上排除"调用方已经放弃"的情况：
+// ctx 已取消或到期时一律不重试；ctx 仍然有效时，单次请求的超时（拨号超时、响应头超时）可以重试。
+func RetryableContext(ctx context.Context, err error) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	return Retryable(err)
+}
+
+func asAPIError(err error, target **APIError) bool { return errors.As(err, target) }
+
+// RetryNotify 是重试通知回调：attempt 是失败的第几次尝试，delay 是即将等待的时间。
+type RetryNotify func(attempt int, delay time.Duration, err error)
+
+type retryKey struct{}
+
+// WithRetryNotify 把重试通知放进 ctx。无论 RetryProvider 被包在多少层 Provider 里面
+// （例如外面再包一层预算控制、模型降级），都能收到通知，而不必对最外层做类型断言。
+func WithRetryNotify(ctx context.Context, fn RetryNotify) context.Context {
+	return context.WithValue(ctx, retryKey{}, fn)
+}
+
+func retryNotifyFrom(ctx context.Context) RetryNotify {
+	fn, _ := ctx.Value(retryKey{}).(RetryNotify)
+	return fn
 }
 
 func newAPIError(provider string, resp *http.Response) error {
@@ -115,7 +151,7 @@ type RetryProvider struct {
 	MaxAttempts int
 	BaseDelay   time.Duration
 	MaxDelay    time.Duration
-	// OnRetry 在每次重试前回调，可用于日志/trace。
+	// OnRetry 在每次重试前回调，可用于日志。按调用区分的通知请用 WithRetryNotify 放进 ctx。
 	OnRetry func(attempt int, delay time.Duration, err error)
 }
 
@@ -141,12 +177,15 @@ func (r *RetryProvider) Stream(ctx context.Context, req *Request, onEvent func(S
 			return resp, nil
 		}
 		lastErr = err
-		if emitted || !Retryable(err) || attempt == r.MaxAttempts {
+		if emitted || !RetryableContext(ctx, err) || attempt == r.MaxAttempts {
 			return nil, err
 		}
 		delay := r.backoff(attempt, err)
 		if r.OnRetry != nil {
 			r.OnRetry(attempt, delay, err)
+		}
+		if fn := retryNotifyFrom(ctx); fn != nil {
+			fn(attempt, delay, err)
 		}
 		select {
 		case <-time.After(delay):

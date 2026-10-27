@@ -17,24 +17,61 @@ import (
 )
 
 // Parse 返回元数据与正文。没有 frontmatter 时元数据为空 map。
+//
+// 支持的 YAML 子集：
+//   - key: value 单行值（可带引号）
+//   - [a, b] 与 "  - item" 两种列表
+//   - key: > / key: | 多行块（> 折叠为一行，| 保留换行）
+//   - 嵌套映射（metadata:\n  author: x）以 "metadata.author" 的形式保存，不会覆盖顶层同名键
+//
+// 文件开头的 UTF-8 BOM 与空行会被忽略。
 func Parse(text string) (map[string]string, string) {
 	meta := map[string]string{}
 	text = strings.ReplaceAll(text, "\r\n", "\n")
-	if !strings.HasPrefix(text, "---\n") {
+	trimmed := strings.TrimLeft(strings.TrimPrefix(text, "\ufeff"), "\n")
+	if !strings.HasPrefix(trimmed, "---\n") {
 		return meta, text
 	}
-	rest := text[4:]
+	rest := trimmed[4:]
 	end := strings.Index(rest, "\n---")
+	if strings.HasPrefix(rest, "---") { // 空 frontmatter："---\n---"
+		rest, end = "\n"+rest, 0
+	}
 	if end < 0 {
 		return meta, text
 	}
-	lastKey := ""
+	var (
+		lastKey   string
+		blockKey  string // 正在读取多行块的键
+		blockFold bool
+		block     []string
+	)
+	flush := func() {
+		if blockKey == "" {
+			return
+		}
+		sep := "\n"
+		if blockFold {
+			sep = " "
+		}
+		meta[blockKey] = strings.TrimSpace(strings.Join(block, sep))
+		blockKey, block = "", nil
+	}
 	for _, line := range strings.Split(rest[:end], "\n") {
-		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
+		indented := strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")
+		t := strings.TrimSpace(line)
+		if blockKey != "" {
+			if indented || t == "" {
+				block = append(block, t)
+				continue
+			}
+			flush()
+		}
+		if t == "" || strings.HasPrefix(t, "#") {
 			continue
 		}
 		// 多行列表项： "  - item"
-		if t := strings.TrimSpace(line); strings.HasPrefix(t, "- ") && lastKey != "" {
+		if strings.HasPrefix(t, "- ") && lastKey != "" {
 			item := unquote(strings.TrimSpace(t[2:]))
 			if meta[lastKey] == "" {
 				meta[lastKey] = item
@@ -43,13 +80,27 @@ func Parse(text string) (map[string]string, string) {
 			}
 			continue
 		}
-		k, v, ok := strings.Cut(line, ":")
+		k, v, ok := strings.Cut(t, ":")
 		if !ok {
 			continue
 		}
-		lastKey = strings.TrimSpace(k)
-		meta[lastKey] = unquote(strings.TrimSpace(v))
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if indented && lastKey != "" {
+			// 嵌套映射：保存为 parent.child，不覆盖顶层键
+			parent := strings.SplitN(lastKey, ".", 2)[0]
+			meta[parent+"."+k] = unquote(v)
+			continue
+		}
+		lastKey = k
+		switch v {
+		case ">", ">-", ">+", "|", "|-", "|+":
+			blockKey, blockFold = k, strings.HasPrefix(v, ">")
+			meta[k] = ""
+			continue
+		}
+		meta[k] = unquote(v)
 	}
+	flush()
 	body := rest[end+4:]
 	body = strings.TrimPrefix(body, "\n")
 	return meta, body

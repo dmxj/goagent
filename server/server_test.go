@@ -358,7 +358,7 @@ func TestPermissionFlow(t *testing.T) {
 				t.Fatalf("应有一个 tool_result：%v", names(evs))
 			}
 			tool := results[0].data["tool"].(map[string]any)
-			p := filepath.Join(s.App.Config.WorkDir, "out.txt")
+			p := filepath.Join(s.App.Config().WorkDir, "out.txt")
 			_, statErr := os.Stat(p)
 			if allow {
 				if tool["is_error"] == true || statErr != nil {

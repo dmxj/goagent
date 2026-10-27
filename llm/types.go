@@ -108,6 +108,15 @@ type Request struct {
 	// ThinkingBudget > 0 时开启扩展思考（仅部分模型支持）。
 	ThinkingBudget int      `json:"thinking_budget,omitempty"`
 	StopSequences  []string `json:"stop_sequences,omitempty"`
+	TopP           *float64 `json:"top_p,omitempty"`
+	TopK           int      `json:"top_k,omitempty"`
+	// NoStream 为 true 时使用非流式接口（一次性返回完整响应）；默认流式。
+	NoStream bool `json:"no_stream,omitempty"`
+	// Headers 是本次请求额外附加的 HTTP 头（覆盖 Provider 的同名头）。
+	Headers map[string]string `json:"headers,omitempty"`
+	// ExtraBody 合并进厂商原生请求体的顶层字段，用于传递厂商特有参数
+	// （例如 DeepSeek / 通义千问的 enable_thinking）。
+	ExtraBody map[string]any `json:"extra_body,omitempty"`
 }
 
 // Usage 记录 token 用量。

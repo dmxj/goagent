@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dmxj/goagent/procenv"
 	"github.com/dmxj/goagent/tool"
 )
 
@@ -23,6 +24,10 @@ type Options struct {
 	MaxOutput int
 	// Shell 默认 /bin/bash（不存在时回退 /bin/sh）。
 	Shell string
+	// Env 是 bash 子进程的环境变量过滤策略（默认只继承白名单变量并剔除密钥）。
+	Env procenv.Policy
+	// FetchTimeout 是 web_fetch 的超时，默认 30 秒。
+	FetchTimeout time.Duration
 }
 
 // DefaultOptions 返回推荐配置。
@@ -71,12 +76,42 @@ func resolvePath(env *tool.Env, opts Options, p string) (string, error) {
 	}
 	p = filepath.Clean(p)
 	if opts.RestrictToWorkDir {
-		rel, err := filepath.Rel(wd, p)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		if !within(wd, p) {
 			return "", fmt.Errorf("路径 %s 超出工作目录 %s，已拒绝访问", p, wd)
+		}
+		// 字面路径在工作目录内，但其中的符号链接可能指向外面（ln -s /etc x; read_file x/passwd）：
+		// 解析路径中已存在部分的符号链接后再检查一次
+		realWD, err1 := filepath.EvalSymlinks(wd)
+		realP, err2 := evalExisting(p)
+		if err1 == nil && err2 == nil && !within(realWD, realP) {
+			return "", fmt.Errorf("路径 %s 经符号链接指向工作目录之外（%s），已拒绝访问", p, realP)
 		}
 	}
 	return p, nil
+}
+
+// within 判断 p 是否在目录 dir 之内（含 dir 本身）。用 filepath.Rel 而不是字符串前缀，避免被 /proj-evil 骗过。
+func within(dir, p string) bool {
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+// evalExisting 解析 p 中已存在部分的符号链接：对尚不存在的文件（write_file 新建），
+// 解析它最近的已存在祖先目录，再拼回剩余部分。
+func evalExisting(p string) (string, error) {
+	rest := ""
+	cur := p
+	for {
+		if real, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(real, rest), nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p, nil
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
 }
 
 // display 返回相对工作目录的展示路径。

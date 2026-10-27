@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"bufio"
 	"github.com/dmxj/goagent/tool"
 )
 
@@ -379,5 +380,98 @@ func TestLockedBuffer(t *testing.T) {
 	}
 	if n := len(b.String()); n > 80*1024 {
 		t.Errorf("stderr 缓冲应限制大小，实际 %d 字节", n)
+	}
+}
+
+// TestServerInitiatedRequest：服务器先发一个与在途请求 id 相同的 ping，再回复真正的响应。
+// 客户端应回复 ping，并且在途请求拿到的是真正的结果而不是 ping。
+func TestServerInitiatedRequest(t *testing.T) {
+	clientR, serverW := io.Pipe()
+	serverR, clientW := io.Pipe()
+	t.Cleanup(func() { clientW.Close(); serverW.Close() })
+	replies := make(chan map[string]any, 4)
+	go func() {
+		sc := bufio.NewScanner(serverR)
+		for sc.Scan() {
+			var req map[string]any
+			_ = json.Unmarshal(sc.Bytes(), &req)
+			id, hasID := req["id"]
+			method, _ := req["method"].(string)
+			switch {
+			case method == "initialize":
+				fmt.Fprintf(serverW, `{"jsonrpc":"2.0","id":%v,"result":{"serverInfo":{"name":"s","version":"1"}}}`+"\n", id)
+			case method == "tools/call":
+				// 先发一个 id 相同的服务器请求 ping，再发一个未知方法的请求，最后才是响应
+				fmt.Fprintf(serverW, `{"jsonrpc":"2.0","id":%v,"method":"ping"}`+"\n", id)
+				fmt.Fprintf(serverW, `{"jsonrpc":"2.0","id":999,"method":"sampling/createMessage"}`+"\n")
+				fmt.Fprintf(serverW, `{"jsonrpc":"2.0","id":%v,"result":{"content":[{"type":"text","text":"真正的结果"}]}}`+"\n", id)
+			case method == "" && hasID:
+				replies <- req // 客户端对服务器请求的回复
+			}
+		}
+	}()
+	c, err := ConnectIO(context.Background(), "s", clientR, clientW)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.CallTool(context.Background(), "x", nil)
+	if err != nil || res.Text() != "真正的结果" {
+		t.Fatalf("在途请求应拿到真正的响应：%v %+v", err, res)
+	}
+	got := map[float64]map[string]any{}
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-replies:
+			got[r["id"].(float64)] = r
+		case <-time.After(3 * time.Second):
+			t.Fatalf("客户端应回复服务器请求，只收到 %v", got)
+		}
+	}
+	if r := got[999]; r == nil || r["error"] == nil {
+		t.Errorf("未知方法应回复 -32601：%v", r)
+	}
+	for id, r := range got {
+		if id != 999 && r["result"] == nil {
+			t.Errorf("ping 应回复空结果：%v", r)
+		}
+	}
+}
+
+func TestManagerSync(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skip(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	demo := ServerConfig{Command: exe, Env: map[string]string{"GOAGENT_MCP_HELPER": "1"}}
+	m := NewManager()
+	defer m.Close()
+	if retired := m.Sync(ctx, map[string]ServerConfig{"a": demo, "bad": {Command: "/nonexistent"}}, false); len(retired) != 0 {
+		t.Fatalf("首次同步不应有旧连接")
+	}
+	first := m.Tools()
+	// 配置不变：复用连接，不重试失败的服务器
+	if retired := m.Sync(ctx, map[string]ServerConfig{"a": demo, "bad": {Command: "/nonexistent"}}, false); len(retired) != 0 {
+		t.Errorf("配置不变时不应替换连接")
+	}
+	if m.Tools()[0] != first[0] || m.ErrorsSnapshot()["bad"] == nil {
+		t.Errorf("配置不变时应复用工具实例并保留错误")
+	}
+	// 修改 a、删除 bad、新增 b
+	changed := demo
+	changed.Args = []string{"-x"}
+	retired := m.Sync(ctx, map[string]ServerConfig{"a": changed, "b": demo}, false)
+	if len(retired) != 1 {
+		t.Fatalf("修改的服务器应返回旧连接：%d", len(retired))
+	}
+	for _, c := range retired {
+		c.Close()
+	}
+	if got := m.Servers(); len(got) != 2 || got["a"] != 4 || got["b"] != 4 {
+		t.Errorf("同步后服务器 = %v", got)
+	}
+	if len(m.ErrorsSnapshot()) != 0 {
+		t.Errorf("删除的服务器不应再保留错误：%v", m.ErrorsSnapshot())
 	}
 }

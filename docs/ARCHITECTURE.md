@@ -12,7 +12,7 @@ flowchart TB
         HTTP[server<br/>HTTP + SSE + Web UI]
         LIB[作为库嵌入]
     end
-    APP[app<br/>依赖组装]
+    APP[app<br/>依赖组装 · 热更新]
     CFG[config<br/>分层配置]
     AG[agent<br/>Agent Loop · 事件]
     LLM[llm<br/>Provider · 流式 · 重试]
@@ -57,18 +57,19 @@ flowchart TB
 | `llm` | 与模型交互的统一抽象：消息、内容块、工具描述、流式事件；Anthropic 与 OpenAI 兼容协议实现；SSE 解析；重试 | `Provider`、`Message`、`ContentBlock`、`StreamEvent`、`RetryProvider`、`MockProvider` |
 | `tool` | 工具接口、注册表、泛型函数工具、反射生成 JSON Schema、文件访问追踪、输出截断 | `Tool`、`Registry`、`Func`、`SchemaOf`、`FileTracker` |
 | `tool/builtin` | 内置工具：文件读写编辑、目录、glob、grep、bash、web_fetch、todo_write | `All`、`Options` |
-| `agent` | Agent Loop：组装请求 → 流式调用 → 工具执行 → 回填；事件发布；会话级运行状态 | `Agent`、`Event`、`Sink` |
-| `permission` | 决定一次工具调用是否允许：模式、规则匹配、人工审批 | `Checker`、`Rule`、`Approver` |
+| `procenv` | bash 与命令钩子的环境变量过滤（白名单 + 密钥黑名单 + 配置覆盖） | `Policy` |
+| `agent` | Agent Loop：组装请求 → 流式调用 → 工具执行 → 回填；事件发布；会话级运行状态（可跨配置版本共享）；Trace 属性 | `Agent`、`States`、`Event`、`Sink` |
+| `permission` | 决定一次工具调用是否允许：模式、规则匹配（bash 命令拆分分析）、人工审批、按会话记住的授权 | `Checker`、`Rule`、`Grants`、`AnalyzeCommand` |
 | `hook` | 在生命周期节点执行用户逻辑（Go 函数或 shell 命令） | `Manager`、`Input`、`Output` |
-| `session` | 一次多轮对话的状态与持久化（原子写入 JSON 文件） | `Session`、`Store`、`FileStore` |
+| `session` | 一次多轮对话的状态与持久化（fsync + 原子写入 JSON 文件，工具调用配对修复） | `Session`、`Store`、`FileStore`、`RepairMessages` |
 | `memory` | 三层记忆：项目指令（AGENTS.md）、长期记忆（Markdown 笔记）、上下文压缩 | `LoadInstructions`、`Store`、`Compactor` |
 | `skill` | 发现技能目录，提供 `skill` 工具按需加载正文 | `Skill`、`Discover`、`Tool` |
 | `subagent` | 子 Agent 定义与 `task` 工具 | `Definition`、`TaskTool`、`Spawn` |
 | `mcp` | MCP 客户端（stdio / Streamable HTTP），把远程工具适配为本地工具；极简 MCP 服务器 | `Client`、`Manager`、`Server` |
-| `trace` | 树状 Span、内存与 JSONL 导出、终端树形渲染 | `Tracer`、`Span`、`Memory`、`File` |
+| `trace` | 树状 Span、密钥脱敏与大小上限、内存与按天滚动的 JSONL 导出、JSON / 终端树形渲染 | `Tracer`、`Span`、`Memory`、`DailyFile`、`BuildTree` |
 | `prompt` | 按 Agent 实际拥有的能力拼装系统提示词 | `Builder` |
-| `config` | 默认值 → 用户级 → 项目级 → 环境变量的分层配置 | `Config`、`Load` |
-| `app` | 依赖注入：根据配置创建并连接所有组件 | `App`、`New` |
+| `config` | 默认值 → Claude Code 导入 → 用户级 → 项目级 → 环境变量的分层配置；模型参数、提示词、工具 / 技能 / 子 Agent 名单 | `Config`、`Load`、`ModelParams` |
+| `app` | 依赖注入：根据配置组装不可变的 `Runtime` 快照；监视配置文件并原子替换（热更新） | `App`、`Runtime`、`New`、`Reload` |
 | `server` | HTTP API、SSE 推送、Web 审批、内置界面 | `Server`、`WebApprover` |
 | `cmd/goagent` | 命令行：REPL、run、serve、trace、sessions、config | — |
 | `internal/frontmatter` | 解析 Markdown 头部元数据（替代 YAML 依赖） | `Parse`、`List`、`Render` |
@@ -117,6 +118,8 @@ sequenceDiagram
 3. **工具层面的失败不是 Go 错误**。参数错误、文件不存在、权限拒绝都以 `IsError=true` 的结果回填，
    模型能看到并自行修正；只有模型调用失败、ctx 取消、超过轮数才会让 `Run` 返回 error。
 4. 每次模型调用结束后、以及 `Run` 返回前都会保存会话（`Store.Save`），进程崩溃最多丢失一轮。
+   保存的历史总是配对完整的：工具执行期间保存时，未完成的调用以"被中断"的错误结果占位；`Run` 开始前与加载会话时
+   也会修复悬空的 `tool_use`（`session.RepairMessages`），`kill -9` 后恢复的会话不会被 API 拒绝。
 
 ## 事件模型
 
@@ -145,7 +148,8 @@ UI 可以依赖它结束"运行中"状态。
 - **Sink 调用是串行的**。`Run` 内部用互斥锁保护 Sink，即使并行工具同时发事件，实现方也无需加锁；
   但 Sink 不应阻塞太久，否则会拖慢 Agent。HTTP 服务用带缓冲的 channel 解耦。
 - **Trace 与事件是两条线**。事件面向实时 UI，Span 面向事后分析；`span_start` / `span_end` 事件
-  把 Span 快照也推给 UI，调试面板可以实时画出调用树。
+  把 Span 的轻量快照（大属性只保留预览）推给 UI，调试面板可以实时画出调用树，包括 `subagent.*` 子树；
+  完整的原始请求体 / 原始流通过 `/v1/traces/{id}/tree` 获取。
 
 ## 关键设计取舍
 
@@ -154,7 +158,8 @@ UI 可以依赖它结束"运行中"状态。
 - **教学**：读者能读懂每一行代码，没有"这里调用了某个库，里面发生了什么不用管"。
   SSE 解析、JSON Schema 生成、frontmatter 解析、MCP 协议都只有几十到几百行，正好是很好的练习。
 - **供应链与部署**：单个静态二进制，`go install` 即可使用；国内网络环境下不需要折腾依赖下载。
-- **代价**：frontmatter 只支持 `key: value` 与简单列表；HTML 转文本是正则实现；没有 OpenTelemetry 导出。
+- **代价**：frontmatter 只支持 `key: value`、简单列表、`>` / `|` 多行块与一层嵌套映射；HTML 转文本是正则实现；
+  配置监视用 mtime 轮询而不是 fsnotify；没有 OpenTelemetry 导出。
   这些都可以在需要时通过实现接口（如 `trace.Exporter`）在外部补上，而不污染核心。
 
 ### 为什么 edit_file 用精确字符串替换
@@ -185,8 +190,33 @@ UI 可以依赖它结束"运行中"状态。
 ### 权限判定顺序
 
 `deny 规则 > plan 模式 > ask 规则 > allow 规则 > 本会话记住 > 模式默认`。
-deny 永远优先，`bypass` 模式下 deny 也有效；plan 模式下即使配置了 allow 也不能执行有副作用的工具。
-"记住"只按工具名记录，粒度粗但不会让模型绕过 ask 规则。
+deny 永远优先，`bypass` 模式下 deny 也有效；plan 模式下即使配置了 allow 也不能执行有副作用的工具
+（但"是否只读"可以由工具按参数判断：`task` 委派给只读子 Agent 时是只读调用）。
+
+bash 命令不再整体做前缀匹配，而是先由 `permission.AnalyzeCommand` 拆成子命令：allow 要求每个子命令都被覆盖，
+deny / ask 任一子命令（含 `$(...)`、`sh -c`、`sudo` 等包装内部的命令）命中即生效，无法安全分析的结构至少询问。
+"记住"按会话存放在 `permission.Grants` 中，热更新重建 Checker 时继续共享；bash 记住子命令前缀，其它工具记住工具名。
+
+### 配置热更新
+
+`app.App` 持有一个当前 `Runtime`（配置 + Agent + 技能 + 子 Agent + 提示词构建器），`Run` 开始时登记引用、结束时释放。
+监视协程每秒比较监视路径（配置文件、提示词文件、技能 / 子 Agent 目录、AGENTS.md 链）的 mtime 指纹，变化后：
+
+1. 从磁盘重新 `config.Load`，叠加命令行参数与 `/model`、`/mode` 运行时覆盖；
+2. 校验（JSON、权限规则、钩子正则、提示词文件、参数范围、Provider），失败则记录错误、保留旧快照；
+3. 组装新 Runtime：MCP 只重连配置变化的服务器；会话状态（`agent.States`）、授权（`permission.Grants`）、
+   长期记忆、Tracer、会话存储跨版本共享；
+4. 原子替换；旧 Runtime 在最后一个使用它的 `Run` 结束后释放，只被它引用的旧 MCP 连接随之关闭。
+
+`Run` 开始前还会同步检查一次，刚保存的修改在紧接着的那条消息里就生效。目录指纹会跟随一层指向目录的符号链接
+（链接进 `skills/` 的共享技能也能热更新）。`reload.enabled: false` 时监视只看配置文件本身，以便运行中重新打开。
+
+### 完整的模型调用 Trace
+
+Provider 通过 ctx 中的 `llm.Recorder` 报告每次 HTTP 往返（`llm.Exchange`）：实际发送的请求体字节、脱敏后的请求头、
+状态码、响应头、非流式响应体或完整原始 SSE 流（用 `io.TeeReader` 边解析边保存）。Agent 把最后一次尝试写入 `llm.call` Span，
+每次尝试的摘要写入 `llm.attempts`。重试通知同样通过 ctx（`llm.WithRetryNotify`）传递，RetryProvider 外面再包几层也能收到。
+大字段受 `trace.max_field_bytes` 限制并带截断标记；配置中的密钥原文与常见密钥格式在写入属性时就被替换为 `[REDACTED]`。
 
 ### 系统提示词按能力生成
 
@@ -204,11 +234,15 @@ deny 永远优先，`bypass` 模式下 deny 也有效；plan 模式下即使配�
 
 `RetryProvider` 一旦向上游发出过任何流式事件就不再重试，否则用户会看到重复的文字。
 限流（429）、过载（529）、5xx、网络抖动会重试；参数错误、鉴权失败立即返回。
+Go 1.23 起拨号超时等网络超时同样满足 `errors.Is(err, context.DeadlineExceeded)`，所以是否重试看的是**调用方的 ctx**：
+`ctx.Err() != nil`（用户取消或总超时）不重试，ctx 仍有效时单次连接超时可以重试（`llm.RetryableContext`）。
 
 ### 子进程管理
 
 `bash` 工具与命令钩子在独立进程组中运行，超时或取消时向整个进程组发送 SIGKILL，
 `go test`、`npm run` 派生的子进程不会变成孤儿。`WaitDelay` 防止后台进程占住输出管道导致永久阻塞。
+子进程只拿到 `procenv.Policy` 过滤后的环境变量（白名单 + 密钥黑名单），模型执行 `env` 看不到 API Key。
+不响应 ctx 的工具在超时后再等 5 秒仍不返回，Agent 放弃等待并回填错误，不会卡死整个循环。
 Windows 没有进程组语义，`internal/procutil` 中退化为只结束主进程。
 
 ## 扩展点一览
@@ -221,4 +255,6 @@ Windows 没有进程组语义，`internal/procutil` 中退化为只结束主进�
 | 拦截 / 改写工具调用 | `hook.Manager.On(hook.PreToolUse, ...)` |
 | 换会话存储（数据库） | 实现 `session.Store` |
 | 导出 Trace 到其它系统 | 实现 `trace.Exporter` |
-| 自定义系统提示词 | 实现 `agent.PromptBuilder`，或设置 `prompt.Builder.Identity` / `Extra` |
+| 自定义系统提示词 | 配置 `system_prompt_file` / `prompt.*`；或实现 `agent.PromptBuilder`，设置 `prompt.Builder.Identity` / `Sections` / `ExtraSections` |
+| 运行时换配置 | 改配置文件（热更新），或调用 `app.Reload` / `SetModel` / `SetMode` |
+| 读取模型调用原始数据 | 在 ctx 中放 `llm.Recorder`，或读 Trace 的 `llm.request.*` / `llm.response.*` 属性 |

@@ -9,6 +9,7 @@ package subagent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"github.com/dmxj/goagent/agent"
 	"github.com/dmxj/goagent/hook"
 	"github.com/dmxj/goagent/internal/frontmatter"
+	"github.com/dmxj/goagent/llm"
 	"github.com/dmxj/goagent/session"
 	"github.com/dmxj/goagent/tool"
 	"github.com/dmxj/goagent/trace"
@@ -31,9 +33,11 @@ type Definition struct {
 	Description string   `json:"description"`
 	Tools       []string `json:"tools,omitempty"` // 为空表示继承父 Agent 的全部工具（task 除外）
 	Model       string   `json:"model,omitempty"` // 为空表示与父 Agent 相同
-	Prompt      string   `json:"-"`
-	MaxTurns    int      `json:"max_turns,omitempty"`
-	Source      string   `json:"source"`
+	// Profile 引用配置 profiles 中的命名模型配置，让子 Agent 使用独立的 Provider（例如主 Agent 用 Claude、explore 用 DeepSeek）。
+	Profile  string `json:"profile,omitempty"`
+	Prompt   string `json:"-"`
+	MaxTurns int    `json:"max_turns,omitempty"`
+	Source   string `json:"source"`
 }
 
 // Builtin 返回内置的子 Agent 定义。
@@ -80,6 +84,7 @@ func Load(dirs ...string) ([]Definition, []error) {
 				Description: meta["description"],
 				Tools:       frontmatter.List(meta["tools"]),
 				Model:       meta["model"],
+				Profile:     meta["profile"],
 				Prompt:      strings.TrimSpace(body),
 				Source:      p,
 			}
@@ -99,11 +104,29 @@ func Load(dirs ...string) ([]Definition, []error) {
 	return defs, errs
 }
 
-// Merge 合并定义，后者覆盖前者同名项。
+// Merge 合并定义，后者覆盖前者同名项。覆盖时没有写出的字段（tools、model、profile、max_turns、正文）
+// 继承被覆盖的定义：只想改 explore 的提示词时，不必把内置的工具列表与轮数上限再抄一遍。
 func Merge(lists ...[]Definition) []Definition {
 	m := map[string]Definition{}
 	for _, l := range lists {
 		for _, d := range l {
+			if old, ok := m[d.Name]; ok {
+				if d.Tools == nil {
+					d.Tools = old.Tools
+				}
+				if d.Model == "" {
+					d.Model = old.Model
+				}
+				if d.Profile == "" {
+					d.Profile = old.Profile
+				}
+				if d.MaxTurns <= 0 {
+					d.MaxTurns = old.MaxTurns
+				}
+				if strings.TrimSpace(d.Prompt) == "" {
+					d.Prompt = old.Prompt
+				}
+			}
 			m[d.Name] = d
 		}
 	}
@@ -136,8 +159,61 @@ type taskArgs struct {
 
 var seq atomic.Int64
 
+// taskTool 是 task 工具。它实现 tool.InputReadOnly：委派给"工具全部只读"的子 Agent（如 explore）时，
+// 这次调用本身就是只读的，plan 模式下也允许；子 Agent 内部的每次工具调用仍会单独经过权限检查。
+type taskTool struct {
+	*tool.FuncTool[taskArgs]
+	parent *agent.Agent
+	byName map[string]Definition
+}
+
+// ReadOnlyFor 判断委派给哪个子 Agent：该子 Agent 可用的工具全部只读时返回 true。
+func (t *taskTool) ReadOnlyFor(input json.RawMessage) bool {
+	var in taskArgs
+	if json.Unmarshal(input, &in) != nil {
+		return false
+	}
+	name := in.Agent
+	if name == "" {
+		name = "general-purpose"
+	}
+	def, ok := t.byName[name]
+	if !ok {
+		return true // 不存在的子 Agent 只会返回错误，不会产生副作用
+	}
+	return ReadOnly(t.parent, def)
+}
+
+// ReadOnly 报告子 Agent 是否只能使用只读工具（工具集为空时视为非只读：它会继承父 Agent 的全部工具）。
+func ReadOnly(parent *agent.Agent, def Definition) bool {
+	tools := parent.Tools.Filter(def.Tools, "task").List()
+	if len(def.Tools) == 0 || len(tools) == 0 {
+		return false
+	}
+	for _, t := range tools {
+		if !t.Info().ReadOnly {
+			return false
+		}
+	}
+	return true
+}
+
+// ProviderResolver 根据 profile 名称返回子 Agent 使用的 Provider 与模型名。
+type ProviderResolver func(profile string) (llm.Provider, string, error)
+
+// Options 是 task 工具的可选配置。
+type Options struct {
+	// Resolve 用于解析子 Agent 定义中的 profile；为 nil 时定义了 profile 的子 Agent 会报错。
+	Resolve ProviderResolver
+}
+
 // TaskTool 创建 task 工具。parent 是父 Agent，defs 为可用的子 Agent 定义。
 func TaskTool(parent *agent.Agent, defs []Definition) tool.Tool {
+	return TaskToolWith(parent, defs, Options{})
+}
+
+// TaskToolWith 与 TaskTool 相同，但可以提供 profile 解析等选项。
+func TaskToolWith(parent *agent.Agent, defs []Definition, opts Options) tool.Tool {
 	byName := map[string]Definition{}
 	var names []string
 	for _, d := range defs {
@@ -157,14 +233,44 @@ func TaskTool(parent *agent.Agent, defs []Definition) tool.Tool {
 				return tool.Errorf("子 Agent 类型 %q 不存在，可用：%s", name, strings.Join(names, ", ")), nil
 			}
 			child := Spawn(parent, def)
+			if def.Profile != "" {
+				if opts.Resolve == nil {
+					return tool.Errorf("子 Agent %s 指定了 profile %q，但当前没有可用的模型配置", def.Name, def.Profile), nil
+				}
+				p, model, err := opts.Resolve(def.Profile)
+				if err != nil {
+					return tool.Errorf("子 Agent %s 的 profile %q 无效：%v", def.Name, def.Profile, err), nil
+				}
+				child.Provider = p
+				if def.Model == "" || def.Model == "inherit" {
+					child.Model = model
+				}
+			}
 			sess := session.New()
 			sess.Parent = c.Env.SessionID
 			ctx, span := parent.Tracer.Start(ctx, "subagent."+def.Name, trace.KindSubagent, map[string]any{
-				"agent": def.Name, "description": in.Description, "prompt": in.Prompt, "child_session": sess.ID,
+				"agent": def.Name, "description": in.Description, "child_session": sess.ID, "read_only": ReadOnly(parent, def),
 			})
-			defer span.Finish()
+			span.SetText("prompt", in.Prompt)
+			// 子 Agent 的 Span 也要实时推送：前端 Trace 视图据此立即画出子树，无需手动刷新
+			sink := agent.SinkFrom(ctx)
+			snap := func() *trace.SpanData {
+				d := span.Snapshot().Light(16<<10, 2<<10)
+				return &d
+			}
+			sink(agent.Event{Type: agent.EventSpanStart, Span: snap()})
+			defer func() {
+				span.Finish()
+				sink(agent.Event{Type: agent.EventSpanEnd, Span: snap()})
+			}()
 			child.Name = fmt.Sprintf("%s#%d", def.Name, seq.Add(1))
 			res, err := child.Run(ctx, sess, in.Prompt, nil) // nil：事件沿用父 ctx 中的 Sink
+			if res != nil {
+				span.SetAttr("turns", res.Turns)
+				span.SetAttr("input_tokens", res.Usage.InputTokens)
+				span.SetAttr("output_tokens", res.Usage.OutputTokens)
+				span.SetText("output", res.Text)
+			}
 			if err != nil {
 				span.Fail(err)
 				text := ""
@@ -173,8 +279,6 @@ func TaskTool(parent *agent.Agent, defs []Definition) tool.Tool {
 				}
 				return &tool.Result{Content: fmt.Sprintf("子 Agent 执行失败：%v\n%s", err, text), IsError: true}, nil
 			}
-			span.SetAttr("turns", res.Turns)
-			span.SetAttr("output_tokens", res.Usage.OutputTokens)
 			if parent.Hooks.Count(hook.SubagentStop) > 0 {
 				_, _ = parent.Hooks.Run(ctx, &hook.Input{Event: hook.SubagentStop, SessionID: sess.ID, WorkDir: parent.WorkDir, LastReply: res.Text, AgentName: child.Name})
 			}
@@ -184,7 +288,7 @@ func TaskTool(parent *agent.Agent, defs []Definition) tool.Tool {
 			}, nil
 		})
 	// 子 Agent 之间互不干扰，可以并行
-	return t.WithConcurrent(true)
+	return &taskTool{FuncTool: t.WithConcurrent(true), parent: parent, byName: byName}
 }
 
 // Spawn 基于父 Agent 与定义创建子 Agent（共享 Provider、权限、钩子、Tracer）。
@@ -210,6 +314,13 @@ func Spawn(parent *agent.Agent, def Definition) *agent.Agent {
 		Model:            model,
 		MaxTokens:        parent.MaxTokens,
 		Temperature:      parent.Temperature,
+		TopP:             parent.TopP,
+		TopK:             parent.TopK,
+		StopSequences:    parent.StopSequences,
+		NoStream:         parent.NoStream,
+		ExtraHeaders:     parent.ExtraHeaders,
+		ExtraBody:        parent.ExtraBody,
+		Version:          parent.Version,
 		Tools:            tools,
 		Permissions:      parent.Permissions,
 		Hooks:            parent.Hooks,

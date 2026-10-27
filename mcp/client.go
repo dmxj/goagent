@@ -293,10 +293,27 @@ func (t *stdioTransport) readLoop(r io.Reader) {
 		if err := json.Unmarshal(sc.Bytes(), &resp); err != nil || resp.ID == nil {
 			continue // 忽略通知与非 JSON 输出
 		}
+		if resp.Method != "" {
+			// 带 id 与 method 的是服务器发给客户端的请求（例如 ping），不是对我们请求的响应：
+			// 不能拿它去匹配在途请求（id 可能恰好相同），而是按协议回复。
+			go func(id int64, method string) { _ = t.write(serverRequestReply(id, method)) }(*resp.ID, resp.Method)
+			continue
+		}
 		if ch, ok := t.pending.LoadAndDelete(*resp.ID); ok {
 			ch.(chan rpcResponse) <- resp
 		}
 	}
+}
+
+// serverRequestReply 构造对服务器请求的回复：ping 返回空结果，其它方法回复"方法不存在"。
+func serverRequestReply(id int64, method string) map[string]any {
+	reply := map[string]any{"jsonrpc": "2.0", "id": id}
+	if method == "ping" {
+		reply["result"] = map[string]any{}
+	} else {
+		reply["error"] = &rpcError{Code: -32601, Message: "客户端不支持方法 " + method}
+	}
+	return reply
 }
 
 func (t *stdioTransport) write(v any) error {
@@ -421,7 +438,18 @@ func (t *httpTransport) call(ctx context.Context, req rpcRequest) (json.RawMessa
 		errFound := errors.New("found")
 		err = llm.ReadSSE(resp.Body, func(e llm.SSEEvent) error {
 			var r rpcResponse
-			if json.Unmarshal([]byte(e.Data), &r) == nil && r.ID != nil && *r.ID == *req.ID {
+			if json.Unmarshal([]byte(e.Data), &r) != nil || r.ID == nil {
+				return nil
+			}
+			if r.Method != "" { // 服务器在流中发来的请求：另起请求回复，不当作响应
+				go func(id int64, method string) {
+					if resp, err := t.post(context.Background(), serverRequestReply(id, method)); err == nil {
+						resp.Body.Close()
+					}
+				}(*r.ID, r.Method)
+				return nil
+			}
+			if *r.ID == *req.ID {
 				out = &r
 				return errFound
 			}

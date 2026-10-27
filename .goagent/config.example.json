@@ -7,11 +7,27 @@
     "retries": 4
   },
   "model": "claude-sonnet-4-5",
-  "max_tokens": 8192,
-  "temperature": 0.2,
-  "thinking_budget": 0,
+  "params": {
+    "max_tokens": 8192,
+    "temperature": 0.2,
+    "top_p": 0.95,
+    "thinking_budget": 0,
+    "stop": [],
+    "stream": true,
+    "extra_headers": {},
+    "extra_body": {}
+  },
   "context_window": 200000,
   "max_turns": 60,
+
+  "system_prompt_file": ".goagent/prompts/system.md",
+  "prompt": {
+    "append": "",
+    "sections": { "environment": true, "tools": true, "skills": true, "subagents": true, "mcp": true, "instructions": true, "memory": true },
+    "extra": [
+      { "title": "团队约定", "content": "提交前运行 gofmt、go vet 与 go test -race。" }
+    ]
+  },
 
   "profiles": {
     "deepseek": {
@@ -22,7 +38,8 @@
     "qwen": {
       "provider": { "type": "openai", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": "${DASHSCOPE_API_KEY}" },
       "model": "qwen-plus",
-      "context_window": 128000
+      "context_window": 128000,
+      "params": { "extra_body": { "enable_thinking": false } }
     },
     "kimi": {
       "provider": { "type": "openai", "base_url": "https://api.moonshot.cn/v1", "api_key": "${MOONSHOT_API_KEY}" },
@@ -37,11 +54,35 @@
     }
   },
 
+  "tools": {
+    "enabled": [],
+    "disabled": [],
+    "options": {
+      "bash": { "timeout_sec": 300, "description": "在工作目录中执行 shell 命令（构建、测试、git）。不要用它读写文件。" },
+      "web_fetch": { "max_output": 20000 }
+    },
+    "restrict_to_workdir": true,
+    "require_read_before_edit": true,
+    "bash_timeout_sec": 120,
+    "bash_env": {
+      "allow": ["MY_PROJECT_ENV"],
+      "deny": [],
+      "extra": { "GOFLAGS": "-mod=mod" },
+      "inherit_all": false
+    },
+    "timeout_sec": 600,
+    "max_parallel": 8,
+    "max_result_bytes": 40000
+  },
+
+  "skills": { "dirs": ["~/.goagent/skills", ".goagent/skills"], "enabled": [], "disabled": [] },
+  "agents": { "dirs": ["~/.goagent/agents", ".goagent/agents"], "enabled": [], "disabled": [] },
+
   "permissions": {
     "mode": "default",
-    "allow": ["bash(go test:*)", "bash(go build:*)", "bash(go vet:*)", "bash(git status)", "bash(git diff:*)", "web_fetch(domain:pkg.go.dev)"],
-    "ask": ["write_file(go.mod)"],
-    "deny": ["bash(rm -rf:*)", "bash(git push:*)", "write_file(.env)"]
+    "allow": ["bash(go test:*)", "bash(go build:*)", "bash(go vet:*)", "bash(gofmt -l:*)", "bash(git status)", "bash(git diff:*)", "web_fetch(domain:pkg.go.dev)"],
+    "ask": ["write_file(go.mod)", "bash(curl:*)"],
+    "deny": ["bash(rm -rf:*)", "bash(git push:*)", "bash(sudo:*)", "write_file(.env)"]
   },
 
   "hooks": {
@@ -58,16 +99,8 @@
     "demo": { "command": "go", "args": ["run", "./examples/mcp-server"] }
   },
 
-  "tools": {
-    "disabled": [],
-    "restrict_to_workdir": true,
-    "require_read_before_edit": true,
-    "bash_timeout_sec": 120
-  },
-
   "memory": { "enabled": true },
   "compact": { "enabled": true, "threshold": 0.8, "keep_recent": 2 },
-  "trace": { "enabled": true },
-
-  "system_prompt_append": ""
+  "trace": { "enabled": true, "max_field_bytes": 4194304 },
+  "reload": { "enabled": true, "interval_ms": 1000 }
 }
